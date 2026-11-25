@@ -3132,6 +3132,8 @@ class BackwardContext:
   contact_Z: array("naconmax", wp.spatial_vector)
   contact_phi: array("naconmax", float)
   contact_point: array("naconmax", wp.vec3)
+  contact_point0: array("naconmax", wp.vec3)
+  contact_normal: array("naconmax", wp.vec3)
   contact_feature: array("naconmax", wp.vec4i)
   contact_adj_dist: array("naconmax", float)
   res_geom_xpos: array("nworld", "ngeom", wp.vec3)

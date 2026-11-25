@@ -53,22 +53,22 @@ _SUPPORTED_PAIRS = {
   # (GeomType.SPHERE, GeomType.ELLIPSOID),
   (GeomType.SPHERE, GeomType.CYLINDER),
   (GeomType.SPHERE, GeomType.BOX),
-  # (GeomType.SPHERE, GeomType.MESH),
+  (GeomType.SPHERE, GeomType.MESH),
   (GeomType.CAPSULE, GeomType.CAPSULE),
   # (GeomType.CAPSULE, GeomType.ELLIPSOID),
-  # (GeomType.CAPSULE, GeomType.CYLINDER),
+  (GeomType.CAPSULE, GeomType.CYLINDER),
   (GeomType.CAPSULE, GeomType.BOX),
-  # (GeomType.CAPSULE, GeomType.MESH),
+  (GeomType.CAPSULE, GeomType.MESH),
   # (GeomType.ELLIPSOID, GeomType.ELLIPSOID),
   # (GeomType.ELLIPSOID, GeomType.CYLINDER),
   # (GeomType.ELLIPSOID, GeomType.BOX),
   # (GeomType.ELLIPSOID, GeomType.MESH),
   # (GeomType.CYLINDER, GeomType.CYLINDER),
   # (GeomType.CYLINDER, GeomType.BOX),
-  # (GeomType.CYLINDER, GeomType.MESH),
+  (GeomType.CYLINDER, GeomType.MESH),
   (GeomType.BOX, GeomType.BOX),
-  # (GeomType.BOX, GeomType.MESH),
-  # (GeomType.MESH, GeomType.MESH),
+  (GeomType.BOX, GeomType.MESH),
+  (GeomType.MESH, GeomType.MESH),
 }
 _UNSUPPORTED_PAIRS = {
   math.upper_trid_index(len(GeomType), first.value, second.value): f"{first.name.lower()}-{second.name.lower()}"
@@ -288,6 +288,8 @@ def _narrowphase_witness(
   nacon_in: wp.array[int],
   # Out:
   contact_point_out: wp.array[wp.vec3],
+  contact_point0_out: wp.array[wp.vec3],
+  contact_normal_out: wp.array[wp.vec3],
   contact_feature_out: wp.array[wp.vec4i],
 ):
   """Writes the feature buffer consumed by each contact's replay branch."""
@@ -306,6 +308,25 @@ def _narrowphase_witness(
     normal = contact_frame_in[cid][0]
     vertex = contact_pos_in[cid] + 0.5 * contact_dist_in[cid] * normal
     contact_point_out[cid] = wp.transpose(geom_xmat_in[w, g1]) @ (vertex - geom_xpos_in[w, g1])
+    return
+
+  if (type1 == GeomType.MESH and type0 != GeomType.HFIELD) or (type0 == GeomType.CAPSULE and type1 == GeomType.CYLINDER):
+    # Freeze BOTH surface witnesses (each geom's local frame), the penetration sign, and
+    # the contact normal in geom1's local frame. Replaying against the live primitive
+    # re-selects closest features (box faces, cylinder caps) that can disagree with the
+    # converged contact under penetration; the double-frozen replay is feature-stable,
+    # and by the envelope theorem its distance gradient matches the sliding-witness one
+    # to first order at the converged contact (margin == 0 caveat as for plane-mesh).
+    # The normal is frozen body-locally rather than recovered from the witness gap: the
+    # gap direction's pose-derivative scales as 1/|dist| and explodes at resting contact.
+    normal = contact_frame_in[cid][0]
+    dist = contact_dist_in[cid]
+    witness1 = contact_pos_in[cid] + 0.5 * dist * normal
+    witness0 = contact_pos_in[cid] - 0.5 * dist * normal
+    contact_point_out[cid] = wp.transpose(geom_xmat_in[w, g1]) @ (witness1 - geom_xpos_in[w, g1])
+    contact_point0_out[cid] = wp.transpose(geom_xmat_in[w, g0]) @ (witness0 - geom_xpos_in[w, g0])
+    contact_normal_out[cid] = wp.transpose(geom_xmat_in[w, g1]) @ normal
+    contact_feature_out[cid] = wp.vec4i(0, 0, 0, wp.where(dist < 0.0, -1, 1))
     return
 
   if type1 != GeomType.BOX or (type0 != GeomType.CAPSULE and type0 != GeomType.BOX):
@@ -349,8 +370,10 @@ def _narrowphase_recompute(
   contact_geomcollisionid_in: wp.array[int],
   nacon_in: wp.array[int],
   # In:
-  contact_point: wp.array[wp.vec3],  # selected mesh vertex in local coordinates
-  contact_feature: wp.array[wp.vec4i],  # capsule/box feature and box clipping candidate
+  contact_point: wp.array[wp.vec3],  # frozen geom1-side witness in local coordinates
+  contact_point0: wp.array[wp.vec3],  # frozen geom0-side witness (double-witness pairs), local coordinates
+  contact_normal: wp.array[wp.vec3],  # frozen contact normal in geom1's local frame (double-witness pairs)
+  contact_feature: wp.array[wp.vec4i],  # capsule/box feature, box clipping candidate, double-witness sign
   # Out:
   cpos_out: wp.array[wp.vec3],
   dist_out: wp.array[float],
@@ -476,6 +499,22 @@ def _narrowphase_recompute(
     dist_out[cid] = dist
     cpos_out[cid] = pos
     frame_out[cid] = math.make_frame(n0)
+  elif (type1 == GeomType.MESH and type0 != GeomType.PLANE and type0 != GeomType.HFIELD) or (
+    type0 == GeomType.CAPSULE and type1 == GeomType.CYLINDER
+  ):
+    # Both surface witnesses frozen in their geom's local frame; the signed gap between
+    # the transformed witnesses recovers dist/pos with gradients through both poses.
+    # Feature-stable under penetration, and first-order exact for the distance at the
+    # converged contact by the envelope theorem. The frame uses the normal frozen in
+    # geom1's frame: recovering it from the gap direction would differentiate
+    # normalize(delta), whose pose-derivative scales as 1/|dist| and explodes at
+    # resting contact, while the body-attached normal's derivative stays bounded.
+    x0 = p0 + m0 @ contact_point0[cid]
+    x1 = p1 + m1 @ contact_point[cid]
+    sign = float(contact_feature[cid][3])
+    dist_out[cid] = sign * wp.length(x1 - x0)
+    cpos_out[cid] = 0.5 * (x0 + x1)
+    frame_out[cid] = math.make_frame(m1 @ contact_normal[cid])
 
 
 # gather dr/defc_pos (efc-row indexed) to the per-contact normal-row distance adjoint
@@ -581,7 +620,8 @@ def contact_qpos_vjp(
   nworld = d_out.qpos.shape[0]
   nv = m.nv
   nconmax = d_out.contact.pos.shape[0]
-  contact_point, contact_feature = bc.contact_point, bc.contact_feature
+  contact_point, contact_point0 = bc.contact_point, bc.contact_point0
+  contact_normal, contact_feature = bc.contact_normal, bc.contact_feature
   contact_adj_dist = bc.contact_adj_dist
   res_geom_xpos, res_geom_xmat = bc.res_geom_xpos, bc.res_geom_xmat
   contact_res_dof, contact_ceff = bc.contact_res_dof, bc.contact_ceff
@@ -608,7 +648,7 @@ def contact_qpos_vjp(
       d_out.contact.worldid,
       d_out.nacon,
     ],
-    outputs=[contact_point, contact_feature],
+    outputs=[contact_point, contact_point0, contact_normal, contact_feature],
   )
   pairs = [
     (m.geom_type, None),
@@ -620,6 +660,8 @@ def contact_qpos_vjp(
     (d_out.contact.geomcollisionid, None),
     (d_out.nacon, None),
     (contact_point, None),
+    (contact_point0, None),
+    (contact_normal, None),
     (contact_feature, None),
   ]
   wp.launch(
