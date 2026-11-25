@@ -12,19 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Adjoints for convex collision detection.
-
-A non-differentiable pass recovers the active collision features from the retained contacts. A
-small differentiable replay then maps contact cotangents to geometry poses. The forward pass does
-not need to retain any additional state. Heightfield contacts are currently integrated; the
-feature-recovery and replay helpers also provide scaffolding for general GJK/EPA adjoints.
-"""
+"""Heightfield contact adjoints: recover contact features, then replay them differentiably."""
 
 import warp as wp
 
-from mujoco_warp._src import adjoint_util
 from mujoco_warp._src import collision_gjk
 from mujoco_warp._src import collision_gjk_adjoint
+from mujoco_warp._src import math
 from mujoco_warp._src.collision_convex import _hfield_filter
 from mujoco_warp._src.collision_core import geom_collision_pair
 from mujoco_warp._src.collision_gjk import _get_face_verts
@@ -57,19 +51,28 @@ _CASE_GJK_SIDE = wp.constant(3)
 _CASE_EPA = wp.constant(4)
 _CASE_EPA_HFIELD = wp.constant(5)
 _CASE_TAG_MASK = wp.constant(7)
+_CASE_DIM_MASK = wp.constant(3)
 _CASE_DIM_SHIFT = wp.constant(3)
 _CASE_SIGN_SHIFT = wp.constant(5)
 _CASE_NEG_BIT = wp.constant(1 << 11)
+
+# Geometry types with heightfield contact replay.
+_CONVEX_TYPES = (
+  GeomType.SPHERE,
+  GeomType.CAPSULE,
+  GeomType.ELLIPSOID,
+  GeomType.CYLINDER,
+  GeomType.BOX,
+  GeomType.MESH,
+)
 
 
 def create_collision_convex_backward_context(
   m: Model, d: Data, nprobe: int | None = None
 ) -> CollisionConvexBackwardContext | None:
-  """Creates reusable convex collision feature-recovery and replay scratch."""
-  if not any(
-    m.geom_pair_type_count[upper_trid_index(len(GeomType), GeomType.HFIELD.value, geom_type.value)]
-    for geom_type in _CONVEX_TYPES
-  ):
+  """Creates heightfield feature-recovery and replay scratch, or None without such pairs."""
+  pair_counts = m.geom_pair_type_count
+  if not any(pair_counts[upper_trid_index(len(GeomType), GeomType.HFIELD.value, t.value)] for t in _CONVEX_TYPES):
     return None
   naconmax = d.contact.pos.shape[0]
   gjk_iterations = int(m.opt.ccd_iterations)
@@ -99,7 +102,7 @@ def create_collision_convex_backward_context(
 
 # Isolate iterative collision code from replay adjoint code generation.
 @wp.kernel(module="unique", enable_backward=False)
-def _hfield_freeze(
+def _hfield_witness(
   # Model:
   opt_ccd_tolerance: wp.array[float],
   geom_type: wp.array[int],
@@ -131,7 +134,7 @@ def _hfield_freeze(
   pair_gap: wp.array2d[float],
   # Data in:
   geom_xpos_in: wp.array2d[wp.vec3],
-  geom_xmat_in: wp.array2d[wp.mat33],
+  geom_xquat_in: wp.array2d[wp.quat],
   contact_dist_in: wp.array[float],
   contact_pos_in: wp.array[wp.vec3],
   contact_frame_in: wp.array[wp.mat33],
@@ -182,12 +185,12 @@ def _hfield_freeze(
   witness1 = contact_pos + half_dist * normal
   witness2 = contact_pos - half_dist * normal
   geom1_pos = geom_xpos_in[worldid, g1]
-  geom1_mat = geom_xmat_in[worldid, g1]
+  geom1_mat = math.quat_to_mat(geom_xquat_in[worldid, g1])
   geom2_pos = geom_xpos_in[worldid, g2]
-  geom2_mat = geom_xmat_in[worldid, g2]
+  geom2_mat = math.quat_to_mat(geom_xquat_in[worldid, g2])
   local1 = wp.transpose(geom1_mat) @ (witness1 - geom1_pos)
   local2 = wp.transpose(geom2_mat) @ (witness2 - geom2_pos)
-  prism_out[cid] = collision_gjk_adjoint._mat33_rows(local1, local2, wp.vec3(0.0, 0.0, 0.0))
+  prism_out[cid] = wp.matrix_from_rows(local1, local2, wp.vec3(0.0, 0.0, 0.0))
   case_out[cid] = int(_CASE_FROZEN) | wp.where(contact_dist < 0.0, _CASE_NEG_BIT, 0)
 
   geomtype2 = geom_type[g2]
@@ -204,11 +207,13 @@ def _hfield_freeze(
   margin = contact_includemargin_in[cid]
   tolerance = opt_ccd_tolerance[worldid % opt_ccd_tolerance.shape[0]]
   # Contacts retain the margin, but not the gap or explicit pair id.
-  gap = geom_gap[worldid % geom_gap.shape[0], g1] + geom_gap[worldid % geom_gap.shape[0], g2]
+  gap_worldid = worldid % geom_gap.shape[0]
+  gap = geom_gap[gap_worldid, g1] + geom_gap[gap_worldid, g2]
+  # Match nxn_pairid in io.py, where the last explicit pair for a geom pair wins.
   for p in range(pair_geom1.shape[0]):
-    if (pair_geom1[p] == g1 and pair_geom2[p] == g2) or (pair_geom1[p] == g2 and pair_geom2[p] == g1):
+    pair1, pair2 = pair_geom1[p], pair_geom2[p]
+    if (pair1 == g1 and pair2 == g2) or (pair1 == g2 and pair2 == g1):
       gap = pair_gap[worldid % pair_gap.shape[0], p]
-      break
 
   # Bound the prism search for this retained contact.
   no_hf_collision, xmin, xmax, ymin, ymax, zmin, zmax = _hfield_filter(
@@ -223,7 +228,7 @@ def _hfield_freeze(
     mesh_graph,
     hfield_size,
     geom_xpos_in,
-    geom_xmat_in,
+    geom_xquat_in,
     worldid,
     g1,
     g2,
@@ -256,7 +261,7 @@ def _hfield_freeze(
     mesh_polymapnum,
     mesh_polymap,
     geom_xpos_in,
-    geom_xmat_in,
+    geom_xquat_in,
     geoms,
     worldid,
   )
@@ -302,6 +307,7 @@ def _hfield_freeze(
 
   best_error = float(MJ_MAXVAL)
   winning_prism = mat63()
+  winning_center = wp.vec3()
   count = int(0)
 
   # Match among the candidates forward retained before contact reduction.
@@ -382,14 +388,12 @@ def _hfield_freeze(
         if error < best_error:
           best_error = error
           winning_prism = hfield_prism
+          winning_center = center
 
   if best_error == MJ_MAXVAL:
     return
 
   geom1.polyvert = winning_prism
-  center = (
-    winning_prism[0] + winning_prism[1] + winning_prism[2] + winning_prism[3] + winning_prism[4] + winning_prism[5]
-  ) * wp.static(1.0 / 6.0)
   _probe_dist, ncontact, _probe_point1, _probe_point2, tag, result, face_index = collision_gjk_adjoint._ccd_probe(
     tolerance,
     gap,
@@ -399,7 +403,7 @@ def _hfield_freeze(
     geom2,
     GeomType.HFIELD.value,
     geomtype2,
-    center,
+    winning_center,
     geom2.pos,
     epa_vert,
     epa_vert_index,
@@ -413,7 +417,7 @@ def _hfield_freeze(
   if ncontact == 0:
     return
 
-  prism_top = collision_gjk_adjoint._mat33_rows(winning_prism[3], winning_prism[4], winning_prism[5])
+  prism_top = wp.matrix_from_rows(winning_prism[3], winning_prism[4], winning_prism[5])
 
   if geomtype2 == GeomType.SPHERE or geomtype2 == GeomType.CAPSULE:
     if tag == collision_gjk_adjoint._TAG_GJK_FEATURE:
@@ -431,21 +435,14 @@ def _hfield_freeze(
         case_out[cid] = _CASE_GJK_SIDE
         return
       signs = int(0)
-      point_a = wp.vec3(0.0, 0.0, 0.0)
-      point_b = wp.vec3(0.0, 0.0, 0.0)
-      point_c = wp.vec3(0.0, 0.0, 0.0)
+      points = wp.mat33()
       for i in range(3):
         if i < dim:
-          if i == 0:
-            point_a = result.simplex1[0]
-          elif i == 1:
-            point_b = result.simplex1[1]
-          else:
-            point_c = result.simplex1[2]
+          points[i] = result.simplex1[i]
           height = wp.dot(result.simplex2[i] - geom2.pos, geom2_axis)
           code = wp.where(height > 0.0, 1, wp.where(height < 0.0, 2, 0))
           signs |= code << (2 * i)
-      prism_out[cid] = collision_gjk_adjoint._mat33_rows(point_a, point_b, point_c)
+      prism_out[cid] = points
       top_out[cid] = prism_top
       case_out[cid] = int(_CASE_GJK_FEATURE) | (dim << _CASE_DIM_SHIFT) | (signs << _CASE_SIGN_SHIFT)
       return
@@ -457,25 +454,20 @@ def _hfield_freeze(
   if is_gjk:
     if result.dim < 1 or result.dim > 3:
       return
-    reference = result.x1 - result.x2
+    reference = result.x2 - result.x1
   elif tag == collision_gjk_adjoint._TAG_EPA and face_index >= 0:
     face_vertices = _get_face_verts(epa_face[face_index])
     marker0 = epa_vert_index[2 * face_vertices[0]]
     marker1 = epa_vert_index[2 * face_vertices[1]]
     marker2 = epa_vert_index[2 * face_vertices[2]]
     mixed = marker0 != marker1 or marker0 != marker2
-    reference = -epa_pr[face_index]
+    reference = epa_pr[face_index]
   else:
     return
 
-  prism_a = wp.vec3(0.0, 0.0, 0.0)
-  prism_b = wp.vec3(0.0, 0.0, 0.0)
-  prism_c = wp.vec3(0.0, 0.0, 0.0)
-  direction_a = wp.vec3(0.0, 0.0, 0.0)
-  direction_b = wp.vec3(0.0, 0.0, 0.0)
-  direction_c = wp.vec3(0.0, 0.0, 0.0)
+  prism = wp.mat33()
+  directions = wp.mat33()
   features = wp.vec4i(-1, -1, -1, -1)
-  geom2_size = geom_size[worldid % geom_size.shape[0], g2]
   for k in range(3):
     point1 = wp.vec3()
     point2 = wp.vec3()
@@ -493,26 +485,20 @@ def _hfield_freeze(
     if geomtype2 == GeomType.CAPSULE:
       height = wp.dot(point2 - geom2.pos, geom2_axis)
       feature = wp.where(height > 0.0, 0, wp.where(height < 0.0, 1, 2))
+    # The direction recovery only uses the reference's sign-independent components.
     ok, support_direction = collision_gjk_adjoint._recover_direction(
-      mesh_vert, geomtype2, point2, feature, geom2.pos, geom2.rot, geom2_size, geom2.margin, geom2.vertadr, reference
+      mesh_vert, geomtype2, point2, feature, geom2.pos, geom2.rot, geom2.size, geom2.margin, geom2.vertadr, reference
     )
     if not ok:
       return
-    if k == 0:
-      prism_a = point1
-      direction_a = support_direction
-    elif k == 1:
-      prism_b = point1
-      direction_b = support_direction
-    else:
-      prism_c = point1
-      direction_c = support_direction
+    prism[k] = point1
+    directions[k] = support_direction
     features[k] = feature
 
   if mixed and (geomtype2 == GeomType.BOX or geomtype2 == GeomType.MESH):
-    delta_a = prism_a - epa_vert[2 * face_vertices[0] + 1]
-    delta_b = prism_b - epa_vert[2 * face_vertices[1] + 1]
-    delta_c = prism_c - epa_vert[2 * face_vertices[2] + 1]
+    delta_a = prism[0] - epa_vert[2 * face_vertices[0] + 1]
+    delta_b = prism[1] - epa_vert[2 * face_vertices[1] + 1]
+    delta_c = prism[2] - epa_vert[2 * face_vertices[2] + 1]
     weights = _tri_affine_coord(delta_a, delta_b, delta_c, epa_pr[face_index])
     point2 = (
       weights[0] * epa_vert[2 * face_vertices[0] + 1]
@@ -526,10 +512,10 @@ def _hfield_freeze(
     if features[3] < 0:
       return
 
-  prism_out[cid] = collision_gjk_adjoint._mat33_rows(prism_a, prism_b, prism_c)
-  direction_out[cid] = collision_gjk_adjoint._mat33_rows(direction_a, direction_b, direction_c)
+  prism_out[cid] = prism
+  direction_out[cid] = directions
   feature_out[cid] = features
-  reference_out[cid] = -reference
+  reference_out[cid] = reference
   top_out[cid] = prism_top
   if is_gjk:
     case_out[cid] = int(_CASE_GJK_FEATURE) | (result.dim << _CASE_DIM_SHIFT)
@@ -550,17 +536,6 @@ def _hfield_project_top(top: wp.mat33, point: wp.vec3) -> wp.vec3:
 
 
 @wp.func
-def _hfield_replay_side(
-  top: wp.mat33, direction: wp.vec3, pos: wp.vec3, axis: wp.vec3, radius: float, half_length: float, margin: float
-) -> tuple[int, float, wp.vec3, wp.vec3]:
-  sign = wp.sign(wp.dot(axis, direction))
-  x2 = pos + sign * half_length * axis - (radius + 0.5 * margin) * wp.vec3(0.0, 0.0, 1.0)
-  x1 = _hfield_project_top(top, x2)
-  dvec = x1 - x2
-  return 1, -wp.sqrt(wp.dot(dvec, dvec)), x1, x2
-
-
-@wp.func
 def _hfield_correct_witness(
   # Model:
   mesh_vert: wp.array[wp.vec3],
@@ -575,7 +550,7 @@ def _hfield_correct_witness(
   vertadr: int,
   point: wp.vec3,
 ) -> tuple[int, float, wp.vec3, wp.vec3]:
-  """Replay the heightfield-specific EPA witness correction."""
+  """Replays the heightfield witness correction of collision_gjk._epa_witness and _inflate."""
   x2 = wp.vec3()
   if geomtype == GeomType.SPHERE or geomtype == GeomType.CAPSULE:
     axis = wp.vec3(mat[0, 2], mat[1, 2], mat[2, 2])
@@ -592,8 +567,141 @@ def _hfield_correct_witness(
   return 1, -wp.sqrt(wp.dot(dvec, dvec)), x1, x2
 
 
-@wp.kernel(enable_backward=True)
+@wp.func
 def _hfield_replay(
+  # In:
+  geom1_pos: wp.vec3,
+  geom1_quat: wp.quat,
+  geom2: collision_gjk.Geom,
+  geom2_quat: wp.quat,
+  geomtype2: int,
+  contact_case: int,
+  prism: wp.mat33,
+  top: wp.mat33,
+  feature: wp.vec4i,
+  direction: wp.mat33,
+  reference: wp.vec3,
+) -> tuple[float, wp.vec3, wp.mat33]:
+  """Evaluates heightfield contact geometry with the recovered feature fixed."""
+  tag = contact_case & _CASE_TAG_MASK
+  if tag == _CASE_DEAD:
+    return 0.0, wp.vec3(), wp.mat33()
+
+  geom1_mat = math.quat_to_mat(geom1_quat)
+  geom2_mat = math.quat_to_mat(geom2_quat)
+  geom2_pos = geom2.pos
+  geom2_size = geom2.size
+  margin = geom2.margin
+  mesh_vert, vertadr = geom2.vert, geom2.vertadr
+
+  if tag == _CASE_FROZEN:
+    dist0, x1w, x2w = collision_gjk_adjoint._replay_frozen(
+      prism, (contact_case & _CASE_NEG_BIT) != 0, geom1_pos, geom1_mat, geom2_pos, geom2_mat
+    )
+    return dist0, 0.5 * (x1w + x2w), make_frame(x1w - x2w if dist0 <= 0.0 else x2w - x1w)
+
+  hfield_mat_t = wp.transpose(geom1_mat)
+  local_pos = hfield_mat_t @ (geom2_pos - geom1_pos)
+  local_mat = hfield_mat_t @ geom2_mat
+  shape_margin = 2.0 * margin
+
+  ok = int(0)
+  dist = float(0.0)
+  x1 = wp.vec3(0.0, 0.0, 0.0)
+  x2 = wp.vec3(0.0, 0.0, 0.0)
+
+  if tag == _CASE_GJK_FEATURE:
+    dim = (contact_case >> _CASE_DIM_SHIFT) & _CASE_DIM_MASK
+    normal_f = wp.vec3()
+    if geomtype2 == GeomType.SPHERE or geomtype2 == GeomType.CAPSULE:
+      axis_f = wp.vec3(local_mat[0, 2], local_mat[1, 2], local_mat[2, 2])
+      half_f = wp.where(geomtype2 == GeomType.CAPSULE, geom2_size[1], 0.0)
+      ok, dist, x1, x2, normal_f = collision_gjk_adjoint._replay_gjk_feature(
+        dim,
+        contact_case >> _CASE_SIGN_SHIFT,
+        prism,
+        local_pos,
+        axis_f,
+        geom2_size[0],
+        half_f,
+        shape_margin,
+      )
+    else:
+      ok, dist, x1, x2, normal_f = collision_gjk_adjoint._replay_gjk(
+        mesh_vert,
+        dim,
+        geomtype2,
+        feature,
+        prism,
+        direction,
+        local_pos,
+        local_mat,
+        geom2_size,
+        shape_margin,
+        vertadr,
+      )
+    if ok != 0:
+      pos = geom1_mat @ (0.5 * (x1 + x2 + margin * wp.normalize(normal_f))) + geom1_pos
+      return dist + margin, pos, make_frame(geom1_mat @ normal_f)
+    return 0.0, wp.vec3(), wp.mat33()
+  elif tag == _CASE_GJK_SIDE:
+    ok, dist, x1, x2 = _hfield_correct_witness(
+      mesh_vert, geomtype2, -1, top, local_pos, local_mat, geom2_size, shape_margin, vertadr, reference
+    )
+  elif tag == _CASE_EPA or tag == _CASE_EPA_HFIELD:
+    ok, dist, x1, x2 = collision_gjk_adjoint._replay_epa(
+      mesh_vert,
+      geomtype2,
+      feature,
+      prism,
+      direction,
+      reference,
+      local_pos,
+      local_mat,
+      geom2_size,
+      shape_margin,
+      vertadr,
+    )
+    if ok != 0 and tag == _CASE_EPA_HFIELD:
+      ok, dist, x1, x2 = _hfield_correct_witness(
+        mesh_vert, geomtype2, feature[3], top, local_pos, local_mat, geom2_size, shape_margin, vertadr, x2
+      )
+
+  if ok == 0:
+    return 0.0, wp.vec3(), wp.mat33()
+
+  normal = x1 - x2 if dist <= 0.0 else x2 - x1
+  pos = geom1_mat @ (0.5 * (x1 + x2 + margin * wp.normalize(normal))) + geom1_pos
+  return dist + margin, pos, make_frame(geom1_mat @ normal)
+
+
+@wp.func
+def _hfield_contract(
+  # In:
+  geom1_pos: wp.vec3,
+  geom1_quat: wp.quat,
+  geom2: collision_gjk.Geom,
+  geom2_quat: wp.quat,
+  geomtype2: int,
+  contact_case: int,
+  prism: wp.mat33,
+  top: wp.mat33,
+  feature: wp.vec4i,
+  direction: wp.mat33,
+  reference: wp.vec3,
+  pos_bar: wp.vec3,
+  dist_bar: float,
+  frame_bar: wp.mat33,
+):
+  dist, pos, frame = _hfield_replay(
+    geom1_pos, geom1_quat, geom2, geom2_quat, geomtype2, contact_case, prism, top, feature, direction, reference
+  )
+  phi = wp.dot(pos, pos_bar) + dist * dist_bar
+  return phi + wp.ddot(frame, frame_bar)
+
+
+@wp.kernel(enable_backward=False)
+def _hfield_vjp(
   # Model:
   geom_type: wp.array[int],
   geom_dataid: wp.array2d[int],
@@ -602,7 +710,7 @@ def _hfield_replay(
   mesh_vert: wp.array[wp.vec3],
   # Data in:
   geom_xpos_in: wp.array2d[wp.vec3],
-  geom_xmat_in: wp.array2d[wp.mat33],
+  geom_xquat_in: wp.array2d[wp.quat],
   contact_includemargin_in: wp.array[float],
   contact_geom_in: wp.array[wp.vec2i],
   contact_worldid_in: wp.array[int],
@@ -614,131 +722,54 @@ def _hfield_replay(
   feature_in: wp.array[wp.vec4i],
   direction_in: wp.array[wp.mat33],
   reference_in: wp.array[wp.vec3],
+  adj_contact_pos: wp.array[wp.vec3],
+  adj_contact_dist: wp.array[float],
+  adj_contact_frame: wp.array[wp.mat33],
   # Out:
-  cpos_out: wp.array[wp.vec3],
-  dist_out: wp.array[float],
-  frame_out: wp.array[wp.mat33],
+  geom_size_grad_out: wp.array2d[wp.vec3],
+  adj_geom_xpos_out: wp.array2d[wp.vec3],
+  adj_geom_xquat_out: wp.array2d[wp.quat],
+  adj_contact_includemargin_out: wp.array[float],
 ):
   cid = wp.tid()
-  if cid >= nacon_in[0]:
+  if cid >= nacon_in[0] or (case_in[cid] & _CASE_TAG_MASK) == _CASE_DEAD:
     return
-  contact_case = case_in[cid]
-  tag = contact_case & _CASE_TAG_MASK
-  if tag == _CASE_DEAD:
-    return
-
-  geoms = contact_geom_in[cid]
-  g1 = geoms[0]
-  g2 = geoms[1]
+  g1, g2 = contact_geom_in[cid][0], contact_geom_in[cid][1]
   worldid = contact_worldid_in[cid]
-  geom1_pos = geom_xpos_in[worldid, g1]
-  geom1_mat = geom_xmat_in[worldid, g1]
-  geom2_pos = geom_xpos_in[worldid, g2]
-  geom2_mat = geom_xmat_in[worldid, g2]
-
-  if tag == _CASE_FROZEN:
-    dist0, x1w, x2w = collision_gjk_adjoint._replay_frozen(
-      prism_in[cid], (contact_case & _CASE_NEG_BIT) != 0, geom1_pos, geom1_mat, geom2_pos, geom2_mat
-    )
-    dist_out[cid] = dist0
-    cpos_out[cid] = 0.5 * (x1w + x2w)
-    frame_out[cid] = make_frame(x1w - x2w if dist0 <= 0.0 else x2w - x1w)
-    return
-
-  hfield_mat_t = wp.transpose(geom1_mat)
-  local_pos = hfield_mat_t @ (geom2_pos - geom1_pos)
-  local_mat = hfield_mat_t @ geom2_mat
-  margin = contact_includemargin_in[cid]
-  shape_margin = 2.0 * margin
-  geom2_size = geom_size[worldid % geom_size.shape[0], g2]
-  geomtype2 = geom_type[g2]
-  vertadr = int(0)
-  if geomtype2 == GeomType.MESH:
+  gw = worldid % geom_size.shape[0]
+  geom2 = collision_gjk.Geom()
+  geom2.pos = geom_xpos_in[worldid, g2]
+  geom2.size = geom_size[gw, g2]
+  geom2.margin = contact_includemargin_in[cid]
+  geom2.vert = mesh_vert
+  if geom_type[g2] == GeomType.MESH:
     dataid = geom_dataid[worldid % geom_dataid.shape[0], g2]
     if dataid >= 0:
-      vertadr = mesh_vertadr[dataid]
-
-  ok = int(0)
-  dist = float(0.0)
-  x1 = wp.vec3(0.0, 0.0, 0.0)
-  x2 = wp.vec3(0.0, 0.0, 0.0)
-
-  if tag == _CASE_GJK_FEATURE:
-    normal_f = wp.vec3()
-    if geomtype2 == GeomType.SPHERE or geomtype2 == GeomType.CAPSULE:
-      axis_f = wp.vec3(local_mat[0, 2], local_mat[1, 2], local_mat[2, 2])
-      half_f = wp.where(geomtype2 == GeomType.CAPSULE, geom2_size[1], 0.0)
-      ok, dist, x1, x2, normal_f = collision_gjk_adjoint._replay_gjk_feature(
-        (contact_case >> _CASE_DIM_SHIFT) & 3,
-        contact_case >> _CASE_SIGN_SHIFT,
-        prism_in[cid],
-        local_pos,
-        axis_f,
-        geom2_size[0],
-        half_f,
-        shape_margin,
-      )
-    else:
-      ok, dist, x1, x2, normal_f = collision_gjk_adjoint._replay_gjk(
-        mesh_vert,
-        (contact_case >> _CASE_DIM_SHIFT) & 3,
-        geomtype2,
-        feature_in[cid],
-        prism_in[cid],
-        direction_in[cid],
-        local_pos,
-        local_mat,
-        geom2_size,
-        shape_margin,
-        vertadr,
-      )
-    if ok != 0:
-      cpos_out[cid] = geom1_mat @ (0.5 * (x1 + x2 + margin * wp.normalize(normal_f))) + geom1_pos
-      dist_out[cid] = dist + margin
-      frame_out[cid] = make_frame(geom1_mat @ normal_f)
-    return
-  elif tag == _CASE_GJK_SIDE:
-    axis_s = wp.vec3(local_mat[0, 2], local_mat[1, 2], local_mat[2, 2])
-    half_s = wp.where(geomtype2 == GeomType.CAPSULE, geom2_size[1], 0.0)
-    ok, dist, x1, x2 = _hfield_replay_side(
-      top_in[cid], reference_in[cid], local_pos, axis_s, geom2_size[0], half_s, shape_margin
-    )
-  elif tag == _CASE_EPA or tag == _CASE_EPA_HFIELD:
-    ok, dist, x1, x2 = collision_gjk_adjoint._replay_epa(
-      mesh_vert,
-      geomtype2,
-      feature_in[cid],
-      prism_in[cid],
-      direction_in[cid],
-      reference_in[cid],
-      local_pos,
-      local_mat,
-      geom2_size,
-      shape_margin,
-      vertadr,
-    )
-    if ok != 0 and tag == _CASE_EPA_HFIELD:
-      ok, dist, x1, x2 = _hfield_correct_witness(
-        mesh_vert, geomtype2, feature_in[cid][3], top_in[cid], local_pos, local_mat, geom2_size, shape_margin, vertadr, x2
-      )
-
-  if ok == 0:
-    return
-
-  normal = x1 - x2 if dist <= 0.0 else x2 - x1
-  cpos_out[cid] = geom1_mat @ (0.5 * (x1 + x2 + margin * wp.normalize(normal))) + geom1_pos
-  dist_out[cid] = dist + margin
-  frame_out[cid] = make_frame(geom1_mat @ normal)
-
-
-_CONVEX_TYPES = (
-  GeomType.SPHERE,
-  GeomType.CAPSULE,
-  GeomType.ELLIPSOID,
-  GeomType.CYLINDER,
-  GeomType.BOX,
-  GeomType.MESH,
-)
+      geom2.vertadr = mesh_vertadr[dataid]
+  derivatives = wp.grad(_hfield_contract)(
+    geom_xpos_in[worldid, g1],
+    geom_xquat_in[worldid, g1],
+    geom2,
+    geom_xquat_in[worldid, g2],
+    geom_type[g2],
+    case_in[cid],
+    prism_in[cid],
+    top_in[cid],
+    feature_in[cid],
+    direction_in[cid],
+    reference_in[cid],
+    adj_contact_pos[cid] if adj_contact_pos else wp.vec3(),
+    adj_contact_dist[cid] if adj_contact_dist else 0.0,
+    adj_contact_frame[cid] if adj_contact_frame else wp.mat33(),
+  )
+  wp.atomic_add(adj_geom_xpos_out, worldid, g1, derivatives[0])  # kernel_analyzer: ignore[atomic]
+  wp.atomic_add(adj_geom_xquat_out, worldid, g1, derivatives[1])  # kernel_analyzer: ignore[atomic]
+  wp.atomic_add(adj_geom_xpos_out, worldid, g2, derivatives[2].pos)  # kernel_analyzer: ignore[atomic]
+  wp.atomic_add(adj_geom_xquat_out, worldid, g2, derivatives[3])  # kernel_analyzer: ignore[atomic]
+  if geom_size_grad_out:
+    wp.atomic_add(geom_size_grad_out, gw, g2, derivatives[2].size)  # kernel_analyzer: ignore[atomic]
+  if adj_contact_includemargin_out:
+    adj_contact_includemargin_out[cid] += derivatives[2].margin
 
 
 @event_scope
@@ -750,20 +781,15 @@ def hfield_contact_pose_vjp(
   res_contact_frame: wp.array,
   adj_contact_dist: wp.array,
   res_geom_xpos: wp.array,
-  res_geom_xmat: wp.array,
+  res_geom_xquat: wp.array,
 ):
   """Accumulates height field contact cotangents into geometry pose cotangents."""
-  ngeomtype = len(GeomType)
-  pair_counts = m.geom_pair_type_count
-  if not any(pair_counts[upper_trid_index(ngeomtype, GeomType.HFIELD.value, t.value)] for t in _CONVEX_TYPES):
-    return
-
   naconmax = d_out.contact.pos.shape[0]
   ctx.probe_count.zero_()
   ctx.overflow.zero_()
 
   wp.launch(
-    _hfield_freeze,
+    _hfield_witness,
     dim=naconmax,
     inputs=[
       m.opt.ccd_tolerance,
@@ -795,7 +821,7 @@ def hfield_contact_pose_vjp(
       m.pair_geom2,
       m.pair_gap,
       d_out.geom_xpos,
-      d_out.geom_xmat,
+      d_out.geom_xquat,
       d_out.contact.dist,
       d_out.contact.pos,
       d_out.contact.frame,
@@ -816,29 +842,30 @@ def hfield_contact_pose_vjp(
     outputs=[ctx.overflow, ctx.case, ctx.prism, ctx.top, ctx.feature, ctx.direction, ctx.reference],
   )
 
-  pairs = [
-    (m.geom_type, None),
-    (m.geom_dataid, None),
-    (m.geom_size, None),
-    (m.mesh_vertadr, None),
-    (m.mesh_vert, None),
-    (d_out.geom_xpos, res_geom_xpos),
-    (d_out.geom_xmat, res_geom_xmat),
-    (d_out.contact.includemargin, None),
-    (d_out.contact.geom, None),
-    (d_out.contact.worldid, None),
-    (d_out.nacon, None),
-    (ctx.case, None),
-    (ctx.prism, None),
-    (ctx.top, None),
-    (ctx.feature, None),
-    (ctx.direction, None),
-    (ctx.reference, None),
-  ]
-  adjoint_util._launch_vjp(
-    _hfield_replay,
-    naconmax,
-    pairs,
-    [d_out.contact.pos, d_out.contact.dist, d_out.contact.frame],
-    [res_contact_pos, adj_contact_dist, res_contact_frame],
+  wp.launch(
+    _hfield_vjp,
+    dim=naconmax,
+    inputs=[
+      m.geom_type,
+      m.geom_dataid,
+      m.geom_size,
+      m.mesh_vertadr,
+      m.mesh_vert,
+      d_out.geom_xpos,
+      d_out.geom_xquat,
+      d_out.contact.includemargin,
+      d_out.contact.geom,
+      d_out.contact.worldid,
+      d_out.nacon,
+      ctx.case,
+      ctx.prism,
+      ctx.top,
+      ctx.feature,
+      ctx.direction,
+      ctx.reference,
+      res_contact_pos,
+      adj_contact_dist,
+      res_contact_frame,
+    ],
+    outputs=[m.geom_size.grad, res_geom_xpos, res_geom_xquat, d_out.contact.includemargin.grad],
   )

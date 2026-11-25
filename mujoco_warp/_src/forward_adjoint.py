@@ -44,6 +44,31 @@ from mujoco_warp._src.warp_util import event_scope
 wp.set_module_options({"enable_backward": True})
 
 
+@wp.func
+def _next_velocity3(
+  # Model:
+  opt_timestep: wp.array[float],
+  # Data in:
+  qvel_in: wp.array2d[float],
+  qacc_in: wp.array2d[float],
+  # In:
+  worldid: int,
+  dofadr: int,
+  # Data out:
+  qvel_out: wp.array2d[float],
+) -> wp.vec3:
+  """Writes and returns the next velocities of three consecutive dofs."""
+  vel = wp.vec3(
+    forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dofadr, 1.0),
+    forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dofadr + 1, 1.0),
+    forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dofadr + 2, 1.0),
+  )
+  qvel_out[worldid, dofadr] = vel[0]
+  qvel_out[worldid, dofadr + 1] = vel[1]
+  qvel_out[worldid, dofadr + 2] = vel[2]
+  return vel
+
+
 @wp.kernel
 def _advance_state(
   # Model:
@@ -59,6 +84,7 @@ def _advance_state(
   qpos_out: wp.array2d[float],
   qvel_out: wp.array2d[float],
 ):
+  """Replays forward state integration; launched with adjoint=True for its VJP."""
   worldid, jntid = wp.tid()
   dt = opt_timestep[worldid % opt_timestep.shape[0]]
   jnttype = jnt_type[jntid]
@@ -68,28 +94,10 @@ def _advance_state(
   qvel_ang = wp.vec3(0.0, 0.0, 0.0)
 
   if jnttype == JointType.FREE:
-    vlx = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 0, 1.0)
-    vly = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 1, 1.0)
-    vlz = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 2, 1.0)
-    vax = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 3, 1.0)
-    vay = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 4, 1.0)
-    vaz = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 5, 1.0)
-    qvel_out[worldid, dadr + 0] = vlx
-    qvel_out[worldid, dadr + 1] = vly
-    qvel_out[worldid, dadr + 2] = vlz
-    qvel_out[worldid, dadr + 3] = vax
-    qvel_out[worldid, dadr + 4] = vay
-    qvel_out[worldid, dadr + 5] = vaz
-    qvel_lin = wp.vec3(vlx, vly, vlz)
-    qvel_ang = wp.vec3(vax, vay, vaz)
+    qvel_lin = _next_velocity3(opt_timestep, qvel_in, qacc_in, worldid, dadr, qvel_out)
+    qvel_ang = _next_velocity3(opt_timestep, qvel_in, qacc_in, worldid, dadr + 3, qvel_out)
   elif jnttype == JointType.BALL:
-    vx = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 0, 1.0)
-    vy = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 1, 1.0)
-    vz = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr + 2, 1.0)
-    qvel_out[worldid, dadr + 0] = vx
-    qvel_out[worldid, dadr + 1] = vy
-    qvel_out[worldid, dadr + 2] = vz
-    qvel_ang = wp.vec3(vx, vy, vz)
+    qvel_ang = _next_velocity3(opt_timestep, qvel_in, qacc_in, worldid, dadr, qvel_out)
   else:
     v = forward.next_velocity(opt_timestep, qvel_in, qacc_in, worldid, dadr, 1.0)
     qvel_out[worldid, dadr] = v
@@ -102,12 +110,13 @@ def _advance_state(
 def _smooth_qvel_vjp(
   # Model:
   opt_timestep: wp.array[float],
+  mapM2D: wp.array[int],
   qD_fullm_i: wp.array[int],
   qD_fullm_j: wp.array[int],
   # Data in:
+  M_in: wp.array2d[float],
   qLU_in: wp.array2d[float],
   # In:
-  M_D: wp.array2d[float],
   lam: wp.array2d[float],
   # Out:
   adj_qvel_out: wp.array2d[float],
@@ -116,8 +125,10 @@ def _smooth_qvel_vjp(
   dt = opt_timestep[worldid % opt_timestep.shape[0]]
   i = qD_fullm_i[elemid]
   j = qD_fullm_j[elemid]
+  mid = mapM2D[elemid]
+  mass = M_in[worldid, mid] if mid >= 0 else 0.0
   wp.atomic_add(
-    adj_qvel_out[worldid], j, (M_D[worldid, elemid] - qLU_in[worldid, elemid]) / dt * lam[worldid, i]
+    adj_qvel_out[worldid], j, (mass - qLU_in[worldid, elemid]) / dt * lam[worldid, i]
   )  # kernel_analyzer: ignore[atomic]
 
 
@@ -125,11 +136,14 @@ def _smooth_qvel_vjp(
 def _smooth_ctrl_vjp(
   # Model:
   opt_timestep: wp.array[float],
+  jnt_dofadr: wp.array[int],
   jnt_actfrclimited: wp.array[bool],
   jnt_actfrcrange: wp.array2d[wp.vec2],
   dof_jntid: wp.array[int],
+  actuator_trntype: wp.array[int],
   actuator_gaintype: wp.array[int],
   actuator_actadr: wp.array[int],
+  actuator_trnid: wp.array[wp.vec2i],
   actuator_gainprm: wp.array2d[vec10],
   actuator_forcelimited: wp.array[bool],
   actuator_forcerange: wp.array2d[wp.vec2],
@@ -175,7 +189,17 @@ def _smooth_ctrl_vjp(
   if actuator_gaintype[actuatorid] == GainType.AFFINE:
     gain += gainprm[1] * actuator_length_in[worldid, actuatorid] + gainprm[2] * actuator_velocity_in[worldid, actuatorid]
     if implicitfast and gainprm[2] != 0.0:
-      # The implicitfast matrix uses clamped control; saturated controls returned above.
+      if derivative._jnt_actfrc_clamped(
+        jnt_dofadr,
+        jnt_actfrclimited,
+        jnt_actfrcrange,
+        actuator_trntype,
+        actuator_trnid,
+        qfrc_actuator_in,
+        worldid,
+        actuatorid,
+      ):
+        return
       moment_qacc, moment_y = float(0.0), float(0.0)
       for i in range(rownnz):
         elemid = rowadr + i
@@ -200,7 +224,7 @@ def _smooth_ctrl_vjp(
 
 
 @wp.func
-def _activation_objective(
+def _activation_contract(
   # In:
   control: float,
   activation: float,
@@ -213,9 +237,9 @@ def _activation_objective(
   ctrlrange: wp.vec2,
   ctrllimited: bool,
   flags: int,
-  force_seed: float,
-  state_seed: float,
-  rate_seed: float,
+  force_bar: float,
+  state_bar: float,
+  rate_bar: float,
 ):
   if ctrllimited and not (flags & DisableBit.CLAMPCTRL):
     # Match the stateless path's inward derivative at either control bound.
@@ -228,7 +252,7 @@ def _activation_objective(
     rate = forward._scalar_act_dot(dyntype, dynprm, control, activation)
   next_activation = support.next_act(timestep, dyntype, dynprm, actrange, activation, rate, 1.0, actlimited)
   force_activation = next_activation if actearly else activation
-  return force_seed * force_activation + state_seed * next_activation + rate_seed * rate
+  return force_bar * force_activation + state_bar * next_activation + rate_bar * rate
 
 
 @wp.kernel(enable_backward=False)
@@ -271,14 +295,14 @@ def _activation_vjp(
   adr = actuator_actadr[uid]
   if adr < 0:
     return
-  force_seed = float(0.0)
+  force_bar = float(0.0)
   force_active = not (opt_disableflags & DisableBit.ACTUATION)
   if actuator_forcelimited[uid]:
     bounds = actuator_forcerange[w % actuator_forcerange.shape[0], uid]
     force = actuator_force_in[w, uid]
     force_active = force_active and force > bounds[0] and force < bounds[1]
   if force_active:
-    moment_seed, _ = smooth_adjoint._actuator_moment_dots(
+    moment_bar, _ = smooth_adjoint._actuator_moment_dots(
       jnt_actfrclimited,
       jnt_actfrcrange,
       dof_jntid,
@@ -290,9 +314,9 @@ def _activation_vjp(
       moment_rowadr_in[w, uid],
       moment_rownnz_in[w, uid],
     )
-    force_seed = actuator_gainprm[w % actuator_gainprm.shape[0], uid][0] * moment_seed
+    force_bar = actuator_gainprm[w % actuator_gainprm.shape[0], uid][0] * moment_bar
   # Force limits suppress force derivatives, but never the activation update itself.
-  gradients = wp.grad(_activation_objective)(
+  gradients = wp.grad(_activation_contract)(
     ctrl_in[w, uid],
     act_in[w, adr],
     opt_timestep[w % opt_timestep.shape[0]],
@@ -304,9 +328,9 @@ def _activation_vjp(
     actuator_ctrlrange[w % actuator_ctrlrange.shape[0], uid],
     actuator_ctrllimited[uid],
     opt_disableflags,
-    force_seed,
-    adj_act[w, adr],
-    adj_act_dot[w, adr],
+    force_bar,
+    adj_act[w, adr] if adj_act else 0.0,
+    adj_act_dot[w, adr] if adj_act_dot else 0.0,
   )
   if adj_ctrl_out:
     adj_ctrl_out[w, uid] += gradients[0]
@@ -317,11 +341,14 @@ def _activation_vjp(
 @wp.kernel(enable_backward=False)
 def _actuator_limit_qvel_vjp(
   # Model:
+  jnt_dofadr: wp.array[int],
   jnt_actfrclimited: wp.array[bool],
   jnt_actfrcrange: wp.array2d[wp.vec2],
   dof_jntid: wp.array[int],
+  actuator_trntype: wp.array[int],
   actuator_gaintype: wp.array[int],
   actuator_biastype: wp.array[int],
+  actuator_trnid: wp.array[wp.vec2i],
   actuator_gainprm: wp.array2d[vec10],
   actuator_biasprm: wp.array2d[vec10],
   actuator_forcelimited: wp.array[bool],
@@ -344,6 +371,19 @@ def _actuator_limit_qvel_vjp(
 ):
   """Corrects actuator velocity derivatives for joint-force limits."""
   w, actid = wp.tid()
+  # The upstream derivative already excludes clamped joint transmissions. Other transmissions
+  # can still couple multiple DOFs, only some of which have clamped joint forces.
+  if derivative._jnt_actfrc_clamped(
+    jnt_dofadr,
+    jnt_actfrclimited,
+    jnt_actfrcrange,
+    actuator_trntype,
+    actuator_trnid,
+    qfrc_actuator_in,
+    w,
+    actid,
+  ):
+    return
   if actuator_forcelimited[actid]:
     bounds = actuator_forcerange[w % actuator_forcerange.shape[0], actid]
     force = actuator_force_in[w, actid]
@@ -424,8 +464,15 @@ def _xfrc_applied_vjp(
   adj_xfrc_applied_out[worldid, bodyid] += wp.spatial_vector(force, torque)
 
 
-@wp.kernel(enable_backward=True)
-def _dampingpoly_Qv_leaf(
+@wp.func
+def _damping_contract(velocity: float, damping: float, poly: wp.vec2, dt: float, acceleration: float, solve_bar: float):
+  """Contracts the velocity-dependent integration matrix with its solve cotangent."""
+  phi = dt * util_misc._poly_force_deriv(damping, poly, velocity, 1) * acceleration
+  return solve_bar * phi
+
+
+@wp.kernel(enable_backward=False)
+def _damping_vjp(
   # Model:
   opt_timestep: wp.array[float],
   jnt_actuatorid: wp.array[int],
@@ -440,8 +487,11 @@ def _dampingpoly_Qv_leaf(
   # Data in:
   qvel_in: wp.array2d[float],
   qacc_in: wp.array2d[float],
+  # In:
+  y: wp.array2d[float],
   # Out:
-  out: wp.array2d[float],
+  adj_qvel_out: wp.array2d[float],
+  dof_damping_grad_out: wp.array2d[float],
 ):
   worldid, dofid = wp.tid()
   dt = opt_timestep[worldid % opt_timestep.shape[0]]
@@ -458,7 +508,15 @@ def _dampingpoly_Qv_leaf(
     worldid,
     dofid,
   )
-  out[worldid, dofid] = dt * util_misc._poly_force_deriv(damping, poly, qvel_in[worldid, dofid], 1) * qacc_in[worldid, dofid]
+  derivatives = wp.grad(_damping_contract)(
+    qvel_in[worldid, dofid], damping, poly, dt, qacc_in[worldid, dofid], -y[worldid, dofid]
+  )
+  adj_qvel_out[worldid, dofid] += derivatives[0]
+  if dof_damping_grad_out:
+    # dof_damping_total adds the DOF coefficient to the actuator contribution.
+    wp.atomic_add(
+      dof_damping_grad_out, worldid % dof_damping.shape[0], dofid, derivatives[1]
+    )  # kernel_analyzer: ignore[atomic]
 
 
 @wp.kernel(enable_backward=False)
@@ -474,7 +532,7 @@ def _implicit_free_body_backward(
   # Data in:
   qvel_in: wp.array2d[float],
   xpos_in: wp.array2d[wp.vec3],
-  xmat_in: wp.array2d[wp.mat33],
+  xquat_in: wp.array2d[wp.quat],
   subtree_com_in: wp.array2d[wp.vec3],
   crb_in: wp.array2d[vec10],
   M_in: wp.array2d[float],
@@ -487,12 +545,12 @@ def _implicit_free_body_backward(
   adj_qvel_out: wp.array2d[float],
   adj_dof_out: wp.array2d[float],
 ):
-  """Transpose the free-body solve and contract its gyroscopic state derivatives."""
+  """Transposes the free-body solve and contracts its gyroscopic state derivatives."""
   worldid, freeid = wp.tid()
   bodyid = body_freeadr[freeid]
   dofadr = body_dofadr[bodyid]
   dt = opt_timestep[worldid % opt_timestep.shape[0]]
-  R = xmat_in[worldid, bodyid]
+  R = math.quat_to_mat(xquat_in[worldid, bodyid])
   crb = crb_in[worldid, bodyid]
   mass = crb[9]
   Iw = wp.mat33(crb[0], crb[3], crb[4], crb[3], crb[1], crb[5], crb[4], crb[5], crb[2])
@@ -521,10 +579,10 @@ def _implicit_free_body_backward(
   factor, pivot, ok = math.lu_factor_6x6(wp.transpose(A))
   if not ok:
     return
-  seed = vec6(0.0)
+  qacc_bar = vec6(0.0)
   for r in range(6):
-    seed[r] = adj_qacc[worldid, dofadr + r]
-  y = math.lu_solve_6x6(factor, pivot, seed)
+    qacc_bar[r] = adj_qacc[worldid, dofadr + r]
+  y = math.lu_solve_6x6(factor, pivot, qacc_bar)
   for r in range(6):
     y_out[worldid, dofadr + r] = y[r]
 
@@ -535,13 +593,13 @@ def _implicit_free_body_backward(
   )
   # Bias is quadratic in velocity, so d(B(v)*a)/dv = B(a).
   lin_acc, rot_acc = math.free_bias_vel_blocks(mass, R, Iw, s, acceleration)
-  adj_velocity = dt * (mass * (wp.transpose(lin_acc) @ y_lin) - wp.transpose(rot_acc) @ y_rot)
+  velocity_bar = dt * (mass * (wp.transpose(lin_acc) @ y_lin) - wp.transpose(rot_acc) @ y_rot)
   # R, Iw and s rotate together for a rigid subtree. Only the linear block changes
   # in world coordinates; the angular block is invariant in the body's frame.
-  adj_rotation = wp.transpose(R) @ wp.cross(y_lin, -dt * mass * (lin @ acceleration))
+  rotation_bar = wp.transpose(R) @ wp.cross(y_lin, -dt * mass * (lin @ acceleration))
   for r in range(3):
-    adj_qvel_out[worldid, dofadr + 3 + r] += adj_velocity[r]
-    adj_dof_out[worldid, dofadr + 3 + r] += adj_rotation[r]
+    adj_qvel_out[worldid, dofadr + 3 + r] += velocity_bar[r]
+    adj_dof_out[worldid, dofadr + 3 + r] += rotation_bar[r]
 
 
 @wp.func
@@ -558,19 +616,14 @@ def _body_wrench(
   if adj_xpos:
     force = adj_xpos[worldid, bodyid]
   if adj_xquat:
-    quat_seed = math.mul_quat(adj_xquat[worldid, bodyid], math.quat_inv(rotation))
-    torque = 0.5 * wp.vec3(quat_seed[1], quat_seed[2], quat_seed[3])
+    torque = adjoint_util._adj_quat_rotation(rotation, adj_xquat[worldid, bodyid])
   return wp.spatial_vector(torque, force)
 
 
 @cache_kernel
-def _kinematics_vjp(nbody: int, shared: bool):
-  """Projects joint and mocap subtree wrenches.
-
-  The shared path reuses body cotangents across GPU threads for performance. The non-shared
-  path avoids cooperative-thread overhead on CPU and handles GPU trees larger than 512 bodies.
-  """
-  tile_size = max(32, 1 << (nbody - 1).bit_length())
+def _kinematics_vjp(nbody: int):
+  """Projects joint and mocap subtree wrenches in bounded body chunks."""
+  tile_size = adjoint_util._body_tile_size(nbody, smooth.WORLD_SUM_CHUNK)
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -603,99 +656,109 @@ def _kinematics_vjp(nbody: int, shared: bool):
   ):
     worldid, lane = wp.tid()
     site_worldid = worldid % site_pos.shape[0]
-    if wp.static(shared):
-      position, wrench = wp.vec3(), wp.spatial_vector()
-      if lane < wp.static(nbody):
-        position = xpos_in[worldid, lane]
-        rotation = xquat_in[worldid, lane]
-        wrench = _body_wrench(rotation, adj_xpos, adj_xquat, worldid, lane)
-        if adj_site_xpos:
-          for siteid in range(nsite):
-            if site_bodyid[siteid] == lane:
-              seed = adj_site_xpos[worldid, siteid]
-              offset = math.rot_vec_quat(site_pos[site_worldid, siteid], rotation)
-              wrench += wp.spatial_vector(wp.cross(offset, seed), seed)
-      # Publish body-local cotangents once for all joint and mocap projections.
-      positions = wp.tile_reshape(wp.tile(position, preserve_type=True), shape=(wp.static(tile_size),))
-      wrenches = wp.tile_reshape(wp.tile(wrench, preserve_type=True), shape=(wp.static(tile_size),))
+    positions = wp.tile_empty(shape=(wp.static(tile_size),), dtype=wp.vec3, storage="shared")
+    wrenches = wp.tile_empty(shape=(wp.static(tile_size),), dtype=wp.spatial_vector, storage="shared")
+    for body_start in range(0, wp.static(nbody), wp.static(tile_size)):
+      for start in range(0, wp.static(tile_size), wp.block_dim()):
+        body = body_start + start + lane
+        position, wrench = wp.vec3(), wp.spatial_vector()
+        if body < wp.static(nbody):
+          position = xpos_in[worldid, body]
+          rotation = xquat_in[worldid, body]
+          wrench = _body_wrench(rotation, adj_xpos, adj_xquat, worldid, body)
+          if adj_site_xpos:
+            for siteid in range(nsite):
+              if site_bodyid[siteid] == body:
+                pos_bar = adj_site_xpos[worldid, siteid]
+                offset = math.rot_vec_quat(site_pos[site_worldid, siteid], rotation)
+                wrench += smooth.transform_force(pos_bar, wp.vec3(), -offset)
+        wp.tile_assign(positions, wp.tile(position, preserve_type=True), offset=(start,))
+        wp.tile_assign(wrenches, wp.tile(wrench, preserve_type=True), offset=(start,))
 
-    for inputid in range(lane, ninput, wp.block_dim()):
-      if inputid < njnt:
-        bodyid = jnt_bodyid[inputid]
-        origin = xanchor_in[worldid, inputid]
-      else:
-        bodyid = mocap_bodyid[inputid - njnt]
-        origin = xpos_in[worldid, bodyid]
-      subtree_end = bodyid + body_subtreenum[bodyid]
-      force, torque = wp.vec3(), wp.vec3()
-      for child in range(bodyid, subtree_end):
-        if wp.static(shared):
-          position = positions[child]
-          wrench = wrenches[child]
+      for inputid in range(lane, ninput, wp.block_dim()):
+        if inputid < njnt:
+          bodyid = jnt_bodyid[inputid]
+          origin = xanchor_in[worldid, inputid]
         else:
-          position = xpos_in[worldid, child]
-          wrench = _body_wrench(xquat_in[worldid, child], adj_xpos, adj_xquat, worldid, child)
-        child_force = wp.spatial_bottom(wrench)
-        force += child_force
-        torque += wp.spatial_top(wrench) + wp.cross(position - origin, child_force)
-      if wp.static(not shared):
-        # Read sites once per input, rather than once per descendant body.
-        if adj_site_xpos:
-          for siteid in range(nsite):
-            child = site_bodyid[siteid]
-            if child >= bodyid and child < subtree_end:
-              seed = adj_site_xpos[worldid, siteid]
-              offset = math.rot_vec_quat(site_pos[site_worldid, siteid], xquat_in[worldid, child])
-              force += seed
-              torque += wp.cross(xpos_in[worldid, child] - origin + offset, seed)
-      if inputid < njnt:
-        qposadr = jnt_qposadr[inputid]
-        jnt_type_ = jnt_type[inputid]
-        if jnt_type_ == JointType.FREE or jnt_type_ == JointType.BALL:
-          if jnt_type_ == JointType.FREE:
-            for i in range(3):
-              adj_qpos_out[worldid, qposadr + i] = force[i]
-            qposadr += 3
-          torque_local = math.rot_vec_quat(torque, math.quat_inv(xquat_in[worldid, bodyid]))
-          # Lift the joint-local angular cotangent into quaternion coordinates.
-          qpos_quat = wp.quat(
-            qpos_in[worldid, qposadr],
-            qpos_in[worldid, qposadr + 1],
-            qpos_in[worldid, qposadr + 2],
-            qpos_in[worldid, qposadr + 3],
-          )
-          norm2 = wp.dot(qpos_quat, qpos_quat)
-          quat_grad = (2.0 / norm2) * math.quat_mul_axis(qpos_quat, torque_local) if norm2 > 0.0 else wp.quat()
-          for i in range(4):
-            adj_qpos_out[worldid, qposadr + i] = quat_grad[i]
-        elif jnt_type_ == JointType.SLIDE:
-          adj_qpos_out[worldid, qposadr] = wp.dot(xaxis_in[worldid, inputid], force)
+          bodyid = mocap_bodyid[inputid - njnt]
+          origin = xpos_in[worldid, bodyid]
+        subtree_end = wp.min(bodyid + body_subtreenum[bodyid], body_start + wp.static(tile_size))
+        force, torque = wp.vec3(), wp.vec3()
+        for child in range(wp.max(bodyid, body_start), subtree_end):
+          position = positions[child - body_start]
+          wrench = wrenches[child - body_start]
+          child_force = wp.spatial_bottom(wrench)
+          force += child_force
+          shifted = smooth.transform_force(child_force, wp.spatial_top(wrench), origin - position)
+          torque += wp.spatial_top(shifted)
+        if inputid < njnt:
+          qposadr = jnt_qposadr[inputid]
+          jnttype = jnt_type[inputid]
+          if jnttype == JointType.FREE or jnttype == JointType.BALL:
+            if jnttype == JointType.FREE:
+              for i in range(3):
+                value = force[i]
+                if body_start > 0:
+                  value += adj_qpos_out[worldid, qposadr + i]
+                adj_qpos_out[worldid, qposadr + i] = value
+              qposadr += 3
+            torque_local = math.rot_vec_quat(torque, math.quat_inv(xquat_in[worldid, bodyid]))
+            qpos_quat = wp.quat(
+              qpos_in[worldid, qposadr],
+              qpos_in[worldid, qposadr + 1],
+              qpos_in[worldid, qposadr + 2],
+              qpos_in[worldid, qposadr + 3],
+            )
+            quat_grad = smooth_kinematics_adjoint._joint_quat_vjp(qpos_quat, torque_local)
+            for i in range(4):
+              value = quat_grad[i]
+              if body_start > 0:
+                value += adj_qpos_out[worldid, qposadr + i]
+              adj_qpos_out[worldid, qposadr + i] = value
+          else:
+            value = wp.dot(xaxis_in[worldid, inputid], torque)
+            if jnttype == JointType.SLIDE:
+              value = wp.dot(xaxis_in[worldid, inputid], force)
+            if body_start > 0:
+              value += adj_qpos_out[worldid, qposadr]
+            adj_qpos_out[worldid, qposadr] = value
         else:
-          adj_qpos_out[worldid, qposadr] = wp.dot(xaxis_in[worldid, inputid], torque)
-      else:
-        mocapid = inputid - njnt
-        adj_mocap_pos_out[worldid, mocapid] = force
-        adj_mocap_quat_out[worldid, mocapid] = smooth_kinematics_adjoint._mocap_quat_vjp(
-          mocap_quat_in[worldid, mocapid], torque
-        )
+          mocapid = inputid - njnt
+          quat_grad = smooth_kinematics_adjoint._mocap_quat_vjp(mocap_quat_in[worldid, mocapid], torque)
+          if body_start > 0:
+            force += adj_mocap_pos_out[worldid, mocapid]
+            quat_grad += adj_mocap_quat_out[worldid, mocapid]
+          adj_mocap_pos_out[worldid, mocapid] = force
+          adj_mocap_quat_out[worldid, mocapid] = quat_grad
+      if wp.static(nbody > tile_size):
+        # Self-copy synchronizes all readers before the next chunk overwrites shared tiles.
+        wp.tile_assign(positions, positions)
 
   return kernel
 
 
+def _implicit_solve(m: Model) -> bool:
+  """Returns whether the integrator advances with Q^-1 M qacc for Q = M - dt * dforce/dqvel."""
+  if m.opt.integrator == IntegratorType.EULER:
+    return not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER))
+  if m.opt.integrator == IntegratorType.IMPLICITFAST:
+    flags = DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
+    return (m.opt.disableflags & flags) != flags
+  return False
+
+
 @event_scope
 def advance_backward(m: Model, d_out: Data, d_bwd: Data, bc: BackwardContext):
-  """Maps integrator cotangents, deferring mass-position dependence to smooth_qpos_backward."""
+  """Propagates state cotangents through the selected integrator."""
   Ma = d_out.efc.Ma
   nworld, nv = d_bwd.nworld, m.nv
   adj_qpos, adj_qvel, adj_qacc = bc.adj_qpos, bc.adj_qvel, bc.adj_qacc
-
-  # Match forward.implicit's IMPLICITFAST branch and forward.euler.
-  flags = DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
-  implicitfast = m.opt.integrator == IntegratorType.IMPLICITFAST and (m.opt.disableflags & flags) != flags
-  eulerdamp = m.opt.integrator == IntegratorType.EULER and not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER))
+  implicit_solve = _implicit_solve(m)
+  implicitfast = implicit_solve and m.opt.integrator == IntegratorType.IMPLICITFAST
+  eulerdamp = implicit_solve and m.opt.integrator == IntegratorType.EULER
   qacc_advance = d_bwd.qacc
 
-  if implicitfast or eulerdamp:
+  if implicit_solve:
     wp.launch(
       forward._compute_damping_deriv,
       dim=(nworld, nv),
@@ -715,7 +778,6 @@ def advance_backward(m: Model, d_out: Data, d_bwd: Data, bc: BackwardContext):
     )
 
   if implicitfast:
-    derivative.deriv_smooth_vel(m, d_bwd, bc.qDeriv)
     wp.launch(
       forward._implicit_free_body_reset_m,
       dim=(nworld, m.body_freeadr.size),
@@ -737,25 +799,18 @@ def advance_backward(m: Model, d_out: Data, d_bwd: Data, bc: BackwardContext):
     qLD, qLDiagInv, qacc_advance = bc.qLD, bc.qLDiagInv, bc.qacc_advance
     smooth.factor_solve_i(m, d_bwd, bc.qDeriv, qLD, qLDiagInv, qacc_advance, bc.Ma)
 
-  pairs = [
-    (m.opt.timestep, None),
-    (m.jnt_type, None),
-    (m.jnt_qposadr, None),
-    (m.jnt_dofadr, None),
-    (d_bwd.qpos, adj_qpos),
-    (d_bwd.qvel, adj_qvel),
-    (qacc_advance, adj_qacc),
-  ]
-  adjoint_util._launch_vjp(
+  wp.launch(
     _advance_state,
-    (nworld, m.njnt),
-    pairs,
+    dim=(nworld, m.njnt),
+    inputs=[m.opt.timestep, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, d_bwd.qpos, d_bwd.qvel, qacc_advance],
     # next_position writes through its output array during the reverse replay.
-    [bc.scratch.qpos, bc.scratch.qvel],
-    [d_out.qpos.grad, d_out.qvel.grad],
+    outputs=[bc.scratch.qpos, bc.scratch.qvel],
+    adj_inputs=[None, None, None, None, adj_qpos, adj_qvel, adj_qacc],
+    adj_outputs=[d_out.qpos.grad, d_out.qvel.grad],
+    adjoint=True,
   )
 
-  if implicitfast or eulerdamp:
+  if implicit_solve:
     smooth.solve_LD(m, d_bwd, qLD, qLDiagInv, bc.y_remap, adj_qacc)
     if implicitfast:
       wp.launch(
@@ -771,7 +826,7 @@ def advance_backward(m: Model, d_out: Data, d_bwd: Data, bc: BackwardContext):
           m.body_freeadr,
           d_bwd.qvel,
           d_bwd.xpos,
-          d_bwd.xmat,
+          d_bwd.xquat,
           d_bwd.subtree_com,
           d_bwd.crb,
           d_bwd.M,
@@ -781,7 +836,7 @@ def advance_backward(m: Model, d_out: Data, d_bwd: Data, bc: BackwardContext):
         ],
         outputs=[bc.y_remap, adj_qvel, bc.adj_dof],
       )
-      model_adjoint.implicitfast_inertia_vjp(m, d_bwd, qacc_advance, bc.y_remap)
+      model_adjoint.free_gyro_vjp(m, d_bwd, qacc_advance, bc.y_remap)
       wp.launch(
         smooth_kinematics_adjoint._dof_to_qpos,
         dim=(nworld, m.njnt),
@@ -796,57 +851,64 @@ def advance_backward(m: Model, d_out: Data, d_bwd: Data, bc: BackwardContext):
 
     if not (m.opt.disableflags & DisableBit.DAMPER):
       # Q = M + dt*D, where D = -d(force_damper)/dv. Its VJP affects velocity and,
-      # when optimized, damping itself. Use a negative seed because qacc = Q^-1 Ma.
-      wp.launch(adjoint_util._neg_cols, dim=(nworld, nv), inputs=[bc.y_remap], outputs=[bc.smooth_r.grad])
-      pairs = [
-        (m.opt.timestep, None),
-        (m.jnt_actuatorid, None),
-        (m.dof_jntid, None),
-        (m.dof_damping, m.dof_damping.grad if m.dof_damping.requires_grad else None),
-        (m.dof_dampingpoly, None),
-        (m.actuator_trntype, None),
-        (m.actuator_trnid, None),
-        (m.actuator_damping, None),
-        (m.actuator_dampingpoly, None),
-        (m.actuator_gear, None),
-        (d_bwd.qvel, bc.adj_qvel_damp),
-        (qacc_advance, None),
-      ]
-      adjoint_util._launch_vjp(_dampingpoly_Qv_leaf, (nworld, nv), pairs, [bc.dampingpoly_Qv], [bc.smooth_r.grad])
-      wp.launch(adjoint_util._accum_cols, dim=(nworld, nv), inputs=[bc.adj_qvel_damp], outputs=[adj_qvel])
+      # when optimized, damping itself. Use a negative cotangent because qacc = Q^-1 Ma.
+      wp.launch(
+        _damping_vjp,
+        dim=(nworld, nv),
+        inputs=[
+          m.opt.timestep,
+          m.jnt_actuatorid,
+          m.dof_jntid,
+          m.dof_damping,
+          m.dof_dampingpoly,
+          m.actuator_trntype,
+          m.actuator_trnid,
+          m.actuator_damping,
+          m.actuator_dampingpoly,
+          m.actuator_gear,
+          d_bwd.qvel,
+          qacc_advance,
+          bc.y_remap,
+        ],
+        outputs=[adj_qvel, m.dof_damping.grad if m.dof_damping.requires_grad else None],
+      )
 
     adj_qacc = bc.adj_qacc_root
+  else:
+    # Later VJPs have no direct integration-mass contribution without a solve.
+    bc.y_remap.zero_()
+    bc.w_dir.zero_()
 
-  wp.launch(adjoint_util._accum_cols, dim=(nworld, nv), inputs=[d_out.qacc.grad], outputs=[adj_qacc])
+  if d_out.qacc.grad is not None:
+    wp.launch(adjoint_util._accum_cols, dim=(nworld, nv), inputs=[d_out.qacc.grad], outputs=[adj_qacc])
   return adj_qpos, adj_qvel, adj_qacc
 
 
 @event_scope
 def smooth_qvel_backward(m: Model, d: Data, d_bwd: Data, lam: wp.array, adj_qvel: wp.array, bc: BackwardContext):
-  """Accumulates non-bias force VJPs for velocity, controls, and applied forces."""
+  """Accumulates smooth-force VJPs for qvel, controls, activations, and applied forces."""
   nworld = d.nworld
-  derivative.deriv_smooth_vel(m, d_bwd, bc.qDeriv)
-  wp.launch(forward._map_m2d, dim=(nworld, m.nD), inputs=[m.mapM2D, bc.qDeriv], outputs=[bc.qLU])
-  # RNE qvel VJP is handled elsewhere via smooth_qpos_backward, avoiding the full Jacobian.
-  # derivative.deriv_rne_vel(m, d_bwd, bc.qLU)
-  wp.launch(forward._map_m2d, dim=(nworld, m.nD), inputs=[m.mapM2D, d_bwd.M], outputs=[bc.M_D])
+  # bc.qLU holds M - dt * dforce/dqvel; smooth_qpos_backward handles the RNE velocity terms.
   wp.launch(
     _smooth_qvel_vjp,
     dim=(nworld, m.nD),
-    inputs=[m.opt.timestep, m.qD_fullm_i, m.qD_fullm_j, bc.qLU, bc.M_D, lam],
+    inputs=[m.opt.timestep, m.mapM2D, m.qD_fullm_i, m.qD_fullm_j, d_bwd.M, bc.qLU, lam],
     outputs=[adj_qvel],
   )
   if not (m.opt.disableflags & DisableBit.ACTUATION):
-    # deriv_smooth_vel includes control clamping but ignores joint-force limits.
+    # Correct only the multi-DOF joint-force limits not handled by deriv_smooth_vel.
     wp.launch(
       _actuator_limit_qvel_vjp,
       dim=(nworld, m.nu),
       inputs=[
+        m.jnt_dofadr,
         m.jnt_actfrclimited,
         m.jnt_actfrcrange,
         m.dof_jntid,
+        m.actuator_trntype,
         m.actuator_gaintype,
         m.actuator_biastype,
+        m.actuator_trnid,
         m.actuator_gainprm,
         m.actuator_biasprm,
         m.actuator_forcelimited,
@@ -871,11 +933,14 @@ def smooth_qvel_backward(m: Model, d: Data, d_bwd: Data, lam: wp.array, adj_qvel
         dim=(nworld, m.nu),
         inputs=[
           m.opt.timestep,
+          m.jnt_dofadr,
           m.jnt_actfrclimited,
           m.jnt_actfrcrange,
           m.dof_jntid,
+          m.actuator_trntype,
           m.actuator_gaintype,
           m.actuator_actadr,
+          m.actuator_trnid,
           m.actuator_gainprm,
           m.actuator_forcelimited,
           m.actuator_forcerange,
@@ -956,43 +1021,30 @@ def smooth_qvel_backward(m: Model, d: Data, d_bwd: Data, lam: wp.array, adj_qvel
 
 
 @event_scope
-def smooth_qpos_backward(m: Model, d: Data, d_bwd: Data, lam: wp.array, res_qpos: wp.array, bc: BackwardContext):
-  """Shares the smooth position reverse with inertial parameters, including direct mass terms."""
+def smooth_qpos_backward(
+  m: Model, d: Data, d_bwd: Data, lam: wp.array, res_qpos: wp.array, res_qvel: wp.array, bc: BackwardContext
+):
+  """Accumulates RNE, spring, and actuator residual VJPs, with inertial and mocap gradients."""
   mocap_grad = d.mocap_pos.grad is not None or d.mocap_quat.grad is not None
-  flags = DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
-  with_mass = (m.opt.integrator == IntegratorType.IMPLICITFAST and (m.opt.disableflags & flags) != flags) or (
-    m.opt.integrator == IntegratorType.EULER and not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER))
+  implicit_solve = _implicit_solve(m)
+  passive_enabled = (m.opt.disableflags & (DisableBit.SPRING | DisableBit.DAMPER)) != (DisableBit.SPRING | DisableBit.DAMPER)
+  smooth_adjoint.rne_backward(
+    m,
+    d_bwd,
+    lam,
+    bc.y_remap if implicit_solve else None,
+    bc.w_dir if implicit_solve else None,
+    res_qpos,
+    res_qvel,
+    bc,
+    xfrc_applied=d.xfrc_applied,
+    body_gravcomp=m.body_gravcomp if passive_enabled else None,
   )
-  # Bound cooperative RNE scratch to eight 128-element spatial-vector tiles.
-  if d.qpos.device.is_cuda and m.nbody <= 128:
-    residual = smooth_adjoint.smooth_force_channels_backward(
-      m, d_bwd, lam, bc.y_remap if with_mass else None, bc.w_dir if with_mass else None, bc, xfrc_applied=d.xfrc_applied
-    )
-  else:
-    if with_mass:
-      direct = smooth_adjoint.mass_matrix_qpos_vjp(m, d, bc.y_remap, bc.w_dir, bc=bc)
-      if mocap_grad:
-        smooth_kinematics_adjoint.kinematics_mocap_backward(m, bc.scratch, bc, scale=1.0)
-      wp.launch(adjoint_util._sub_cols, dim=res_qpos.shape, inputs=[res_qpos, direct], outputs=[res_qpos])
-      model_adjoint.inertia_param_vjp(m, bc.scratch, bc, scale=1.0)
-    smooth.rne(m, d_bwd, flg_acc=True)
-    residual = smooth_adjoint.smooth_force_backward(m, d_bwd, lam, bc=bc, xfrc_applied=d.xfrc_applied)
-  wp.launch(adjoint_util._accum_cols, dim=residual.shape, inputs=[residual], outputs=[res_qpos])
   if mocap_grad:
     smooth_kinematics_adjoint.kinematics_mocap_backward(m, d_bwd, bc)
-  # Consume the inertia cotangents before gravcomp reuses the workspace.
-  model_adjoint.inertia_param_vjp(m, d_bwd, bc)
-  for vjp in (
-    smooth_adjoint.spring_qpos_vjp,
-    smooth_adjoint.actuator_qpos_vjp,
-    smooth_adjoint.gravcomp_qpos_vjp,
-  ):
-    residual = vjp(m, d_bwd, lam, bc=bc)
-    wp.launch(adjoint_util._accum_cols, dim=residual.shape, inputs=[residual], outputs=[res_qpos])
-  # Gravcomp leaves mass and COM cotangents in the same workspace.
-  if mocap_grad:
-    smooth_kinematics_adjoint.kinematics_mocap_backward(m, d_bwd, bc)
-  model_adjoint.inertia_param_vjp(m, d_bwd, bc)
+  model_adjoint.inertia_vjp(m, d_bwd, bc)
+  smooth_adjoint.spring_qpos_vjp(m, d_bwd, lam, res_qpos)
+  smooth_adjoint.actuator_qpos_vjp(m, d_bwd, lam, res_qpos, bc)
 
 
 @event_scope
@@ -1000,11 +1052,9 @@ def kinematics_backward(m: Model, d_out: Data, d_bwd: Data, bc: BackwardContext)
   """Maps kinematic output gradients to qpos and mocap inputs."""
   mocap_grad = d_bwd.mocap_pos.grad is not None or d_bwd.mocap_quat.grad is not None
   ninput = m.njnt + (m.nmocap if mocap_grad else 0)
-  # Bound shared storage; the same wrench contraction also handles CPU and large trees.
-  shared = d_bwd.qpos.device.is_cuda and m.nbody <= 512
-  block_dim = max(32, 1 << (m.nbody - 1).bit_length()) if shared else 128
+  block_dim = adjoint_util._body_tile_size(m.nbody, smooth.WORLD_SUM_CHUNK)
   wp.launch_tiled(
-    _kinematics_vjp(m.nbody, shared),
+    _kinematics_vjp(m.nbody),
     dim=d_bwd.nworld,
     block_dim=block_dim,
     inputs=[

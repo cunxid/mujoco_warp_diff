@@ -27,6 +27,7 @@ from mujoco_warp._src.types import ConstraintState
 from mujoco_warp._src.types import ConstraintType
 from mujoco_warp._src.types import JointType
 from mujoco_warp._src.types import vec5
+from mujoco_warp._src.types import vec10
 from mujoco_warp._src.types import vec12
 from mujoco_warp._src.warp_util import cache_kernel
 
@@ -38,183 +39,88 @@ _MAXCONDIM = 6  # max valid MuJoCo condim; elliptic friction rows = dimid 1..con
 _MAX_PYRAMID_EDGES = 10  # 2*(_MAXCONDIM - 1) pyramidal edges at condim 6
 
 
-# Non-contact constraint residual VJP (equality / joint-limit / dof-friction rows), orchestrated by
-# adjoint._residual_constraint_sparse; contact rows live in the bottom section of this file.
-#   gather (manual): Z_e = sum_i J_ei*lam_i + true topology invweight (A/V stay frozen anchors).
-#   leaf _constraint_row_phi (loop-free, only AD'd piece): phi_e = -Z*f, f anchored to efc.force.
-#   scatter (manual): res_qvel += J*Vbar (all rows); res_dof += J*Pbar (position-bearing only).
-# Routing: dense or CSR according to m.is_sparse.
+# Non-contact residuals gather J*lambda, differentiate a scalar row contraction, and scatter
+# its cotangents in one kernel. Constraint states and solver quantities remain frozen.
 
 
-# gather (manual): per active non-contact row, reduce Z = J*lam and the topology invweight;
-# mirrors solver._solve_init_jaref_kernel's CSR/dense J iterator (keep in sync)
-@cache_kernel
-def _constraint_gather(is_sparse: bool):
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # Model:
-    nv: int,
-    jnt_dofadr: wp.array[int],
-    dof_invweight0: wp.array2d[float],
-    eq_obj1id: wp.array[int],
-    eq_obj2id: wp.array[int],
-    # Data in:
-    nefc_in: wp.array[int],
-    efc_type_in: wp.array2d[int],
-    efc_id_in: wp.array2d[int],
-    efc_J_rownnz_in: wp.array2d[int],
-    efc_J_rowadr_in: wp.array2d[int],
-    efc_J_colind_in: wp.array3d[int],
-    efc_J_in: wp.array3d[float],
-    efc_state_in: wp.array2d[int],
-    # In:
-    lam_in: wp.array2d[float],
-    # Out:
-    Z_out: wp.array2d[float],
-    invw_out: wp.array2d[float],
-  ):
-    w, row = wp.tid()
-    Z_out[w, row] = 0.0
-    invw_out[w, row] = 0.0
-    if row >= nefc_in[w]:
-      return
-    ty = efc_type_in[w, row]
-    if ty != ConstraintType.EQUALITY and ty != ConstraintType.LIMIT_JOINT and ty != ConstraintType.FRICTION_DOF:
-      return  # contact rows -> _contact_*; TODO(etaoxing): tendon limit/friction (structural gate raises)
-    if efc_state_in[w, row] == ConstraintState.SATISFIED:
-      return
-    Z = float(0.0)
-    if wp.static(is_sparse):
-      rownnz = efc_J_rownnz_in[w, row]
-      rowadr = efc_J_rowadr_in[w, row]
-      for k in range(rownnz):
-        sid = rowadr + k
-        Z += efc_J_in[w, 0, sid] * lam_in[w, efc_J_colind_in[w, 0, sid]]
-    else:
-      for i in range(nv):
-        Z += efc_J_in[w, row, i] * lam_in[w, i]
-    Z_out[w, row] = Z
-    cid = efc_id_in[w, row]
-    if ty == ConstraintType.FRICTION_DOF:
-      invw_out[w, row] = dof_invweight0[w % dof_invweight0.shape[0], cid]
-    elif ty == ConstraintType.LIMIT_JOINT:
-      invw_out[w, row] = dof_invweight0[w % dof_invweight0.shape[0], jnt_dofadr[cid]]
-    else:  # The support gate admits only joint equalities; match constraint._equality_joint.
-      model_worldid = w % dof_invweight0.shape[0]
-      invweight = dof_invweight0[model_worldid, jnt_dofadr[eq_obj1id[cid]]]
-      joint2 = eq_obj2id[cid]
-      if joint2 >= 0:
-        invweight += dof_invweight0[model_worldid, jnt_dofadr[joint2]]
-      invw_out[w, row] = invweight
-
-  return kernel
-
-
-# loop-free row leaf: phi_e = -Z*f, f value-anchored to the stored efc.force
-@wp.kernel(enable_backward=True)
-def _constraint_row_phi(
-  # Model:
-  opt_timestep: wp.array[float],
-  opt_disableflags: int,
-  jnt_solref: wp.array2d[wp.vec2],
-  jnt_solimp: wp.array2d[vec5],
-  dof_solref: wp.array2d[wp.vec2],
-  dof_solimp: wp.array2d[vec5],
-  dof_frictionloss: wp.array2d[float],
-  eq_solref: wp.array2d[wp.vec2],
-  eq_solimp: wp.array2d[vec5],
-  # Data in:
-  nefc_in: wp.array[int],
-  efc_type_in: wp.array2d[int],
-  efc_id_in: wp.array2d[int],
-  efc_pos_in: wp.array2d[float],
-  efc_margin_in: wp.array2d[float],
-  efc_D_in: wp.array2d[float],
-  efc_vel_in: wp.array2d[float],
-  efc_aref_in: wp.array2d[float],
-  efc_force_in: wp.array2d[float],
-  efc_state_in: wp.array2d[int],
+@wp.func
+def _constraint_contract(
   # In:
-  Z_in: wp.array2d[float],  # = J*lam (gather) -> Zbar (= -f; the dJ/dq topology seed, unused for G1)
-  invw_in: wp.array2d[float],  # topology inverse weight
-  ctx_Jaref_in: wp.array2d[float],  # frozen J*qacc - aref (jaref value anchor)
-  # Out:
-  phi_out: wp.array2d[float],
+  pos: float,
+  velocity: float,
+  Z: float,
+  solref: wp.vec2,
+  solimp: vec5,
+  frictionloss: float,
+  invweight: float,
+  timestep: float,
+  disableflags: int,
+  constraint_type: int,
+  state: int,
+  aref: float,
+  force: float,
+  D_ref: float,
+  Jaref_ref: float,
 ):
-  w, row = wp.tid()
-  phi_out[w, row] = 0.0  # assign the output before any early return
-  if row >= nefc_in[w]:
-    return
-  ty = efc_type_in[w, row]
-  if ty != ConstraintType.EQUALITY and ty != ConstraintType.LIMIT_JOINT and ty != ConstraintType.FRICTION_DOF:
-    return
-  st = efc_state_in[w, row]
-  if st == ConstraintState.SATISFIED:
-    return
-  cid = efc_id_in[w, row]
-  Z = Z_in[w, row]
-  if ty == ConstraintType.FRICTION_DOF and st == ConstraintState.LINEARNEG:  # saturated friction: force = +frictionloss
-    phi_out[w, row] = -Z * dof_frictionloss[w % dof_frictionloss.shape[0], cid]
-    return
-  if ty == ConstraintType.FRICTION_DOF and st == ConstraintState.LINEARPOS:  # saturated friction: force = -frictionloss
-    phi_out[w, row] = -Z * (-dof_frictionloss[w % dof_frictionloss.shape[0], cid])
-    return
-  # QUADRATIC (equality / active limit / stuck friction): f = -D*jaref, value-anchored to efc.force.
-  dt = opt_timestep[w % opt_timestep.shape[0]]
-  P = efc_pos_in[w, row] - efc_margin_in[w, row]
-  V = efc_vel_in[w, row]
-  if ty == ConstraintType.FRICTION_DOF:
-    sr = dof_solref[w % dof_solref.shape[0], cid]
-    si = dof_solimp[w % dof_solimp.shape[0], cid]
-    kbi = constraint._contact_kbimp(opt_disableflags, dt, sr, si, P, False)
-  elif ty == ConstraintType.EQUALITY:
-    sr = eq_solref[w % eq_solref.shape[0], cid]
-    si = eq_solimp[w % eq_solimp.shape[0], cid]
-    kbi = constraint._contact_kbimp(opt_disableflags, dt, sr, si, P, False)
-  else:  # LIMIT_JOINT (slide/hinge scalar J; ball 3-dof -axis J)
-    sr = jnt_solref[w % jnt_solref.shape[0], cid]
-    si = jnt_solimp[w % jnt_solimp.shape[0], cid]
-    kbi = constraint._contact_kbimp(opt_disableflags, dt, sr, si, P, False)
-  k = 0.0 if ty == ConstraintType.FRICTION_DOF else kbi[0]
-  b = kbi[1]
-  imp = kbi[2]
-  g = k * imp * P + b * V
-  Jaref0 = ctx_Jaref_in[w, row]
-  jaref = Jaref0 + efc_aref_in[w, row] + g  # value == Jaref0 at base (efc.aref = -g_base, same _contact_kbimp)
-  D_ref = efc_D_in[w, row]
-  D = constraint._efc_D(invw_in[w, row], imp)
+  """Returns phi = -Z*f for an active non-contact row, anchored to its stored force."""
+  if constraint_type == ConstraintType.FRICTION_DOF:
+    if state == ConstraintState.LINEARNEG:
+      return -Z * frictionloss
+    if state == ConstraintState.LINEARPOS:
+      return Z * frictionloss
+  kbi = constraint._contact_kbimp(disableflags, timestep, solref, solimp, pos, False)
+  k = 0.0 if constraint_type == ConstraintType.FRICTION_DOF else kbi[0]
+  b, imp = kbi[1], kbi[2]
+  g = k * imp * pos + b * velocity
+  jaref = Jaref_ref + aref + g
+  D = constraint._efc_D(invweight, imp)
   F_state = -D * jaref
-  F_state0 = -D_ref * Jaref0  # frozen base (== F_state at base)
-  f = efc_force_in[w, row] + (F_state - F_state0)  # value anchor: f base == efc.force_ref byte-exact
-  phi_out[w, row] = -Z * f
+  F_state0 = -D_ref * Jaref_ref
+  f = force + (F_state - F_state0)
+  return -Z * f
 
 
 @wp.func
-def _joint_jacobian_objective(x: float, data: vec12, seed: float):
+def _joint_jacobian_contract(x: float, data: vec12, jacobian_bar: float):
   _, slope = constraint._joint_polynomial(data, x)
-  return -seed * slope
+  return -jacobian_bar * slope
 
 
 @wp.func
-def _ball_jacobian_objective(delta: wp.vec3, quat: wp.quat, seed: wp.vec3):
+def _ball_axis_angle(quat: wp.quat) -> tuple[wp.vec3, float]:
+  """Normalizes a ball-joint quaternion and returns its rotation axis and angle."""
+  return math.normalize_with_norm(math.quat_to_vel(wp.normalize(quat)))
+
+
+@wp.func
+def _ball_jacobian_contract(delta: wp.vec3, quat: wp.quat, axis_bar: wp.vec3):
   rotated = math.quat_integrate(quat, delta, 1.0)
-  axis, _ = constraint._ball_axis_angle(rotated)
-  return -wp.dot(axis, seed)
+  axis, _ = _ball_axis_angle(rotated)
+  return -wp.dot(axis, axis_bar)
 
 
-# scatter (manual): re-walk the row's J support; res_qvel_out += J*Vbar for all active rows,
-# res_dof_out += J*Pbar only for position-bearing rows (a friction row's P is identically zero)
 @cache_kernel
-def _constraint_scatter(is_sparse: bool):
+def _constraint_residual(is_sparse: bool, param_grad: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
     nv: int,
+    opt_timestep: wp.array[float],
+    opt_disableflags: int,
     qpos0: wp.array2d[float],
     jnt_type: wp.array[int],
     jnt_qposadr: wp.array[int],
     jnt_dofadr: wp.array[int],
+    jnt_solref: wp.array2d[wp.vec2],
+    jnt_solimp: wp.array2d[vec5],
+    dof_solref: wp.array2d[wp.vec2],
+    dof_solimp: wp.array2d[vec5],
+    dof_frictionloss: wp.array2d[float],
+    dof_invweight0: wp.array2d[float],
+    eq_obj1id: wp.array[int],
     eq_obj2id: wp.array[int],
+    eq_solref: wp.array2d[wp.vec2],
+    eq_solimp: wp.array2d[vec5],
     eq_data: wp.array2d[vec12],
     # Data in:
     nefc_in: wp.array[int],
@@ -227,17 +133,26 @@ def _constraint_scatter(is_sparse: bool):
     efc_J_rowadr_in: wp.array2d[int],
     efc_J_colind_in: wp.array3d[int],
     efc_J_in: wp.array3d[float],
+    efc_pos_in: wp.array2d[float],
+    efc_margin_in: wp.array2d[float],
     efc_D_in: wp.array2d[float],
+    efc_vel_in: wp.array2d[float],
+    efc_aref_in: wp.array2d[float],
+    efc_force_in: wp.array2d[float],
     efc_state_in: wp.array2d[int],
     # In:
-    adjP_in: wp.array2d[float],  # Pbar (dphi/defc.pos)
-    adjV_in: wp.array2d[float],  # Vbar (dphi/defc.vel)
-    lam_in: wp.array2d[float],
-    Z_in: wp.array2d[float],
-    adjZ_in: wp.array2d[float],
+    lam: wp.array2d[float],
+    ctx_Jaref: wp.array2d[float],
     # Out:
     res_qvel_out: wp.array2d[float],
     res_dof_out: wp.array2d[float],
+    res_jnt_solref_out: wp.array2d[wp.vec2],
+    res_jnt_solimp_out: wp.array2d[vec5],
+    res_dof_solref_out: wp.array2d[wp.vec2],
+    res_dof_solimp_out: wp.array2d[vec5],
+    res_dof_frictionloss_out: wp.array2d[float],
+    res_eq_solref_out: wp.array2d[wp.vec2],
+    res_eq_solimp_out: wp.array2d[vec5],
   ):
     w, row = wp.tid()
     if row >= nefc_in[w]:
@@ -245,19 +160,90 @@ def _constraint_scatter(is_sparse: bool):
     ty = efc_type_in[w, row]
     if ty != ConstraintType.EQUALITY and ty != ConstraintType.LIMIT_JOINT and ty != ConstraintType.FRICTION_DOF:
       return
-    if efc_state_in[w, row] == ConstraintState.SATISFIED:
+    st = efc_state_in[w, row]
+    if st == ConstraintState.SATISFIED:
       return
-    Vb = adjV_in[w, row]
-    Pb = adjP_in[w, row]
-    # position-bearing rows; FRICTION_DOF excluded (its P == 0, no qpos route)
-    route_p = ty == ConstraintType.LIMIT_JOINT or ty == ConstraintType.EQUALITY
-    count = nv
-    start = int(0)
+
+    # Gather the same dense or CSR row in its original order.
+    count, start = nv, int(0)
     if wp.static(is_sparse):
       count = efc_J_rownnz_in[w, row]
       start = efc_J_rowadr_in[w, row]
+    Z = float(0.0)
     for k in range(count):
-      i = k
+      i, jj = k, float(0.0)
+      if wp.static(is_sparse):
+        sid = start + k
+        i = efc_J_colind_in[w, 0, sid]
+        jj = efc_J_in[w, 0, sid]
+      else:
+        jj = efc_J_in[w, row, i]
+      Z += jj * lam[w, i]
+
+    cid = efc_id_in[w, row]
+    model_worldid = w % dof_invweight0.shape[0]
+    invweight = float(0.0)
+    sr, si, frictionloss = wp.vec2(), vec5(), float(0.0)
+    if ty == ConstraintType.FRICTION_DOF:
+      invweight = dof_invweight0[model_worldid, cid]
+      sr = dof_solref[w % dof_solref.shape[0], cid]
+      si = dof_solimp[w % dof_solimp.shape[0], cid]
+      frictionloss = dof_frictionloss[w % dof_frictionloss.shape[0], cid]
+    elif ty == ConstraintType.LIMIT_JOINT:
+      invweight = dof_invweight0[model_worldid, jnt_dofadr[cid]]
+      sr = jnt_solref[w % jnt_solref.shape[0], cid]
+      si = jnt_solimp[w % jnt_solimp.shape[0], cid]
+    else:
+      invweight = dof_invweight0[model_worldid, jnt_dofadr[eq_obj1id[cid]]]
+      joint2 = eq_obj2id[cid]
+      if joint2 >= 0:
+        invweight += dof_invweight0[model_worldid, jnt_dofadr[joint2]]
+      sr = eq_solref[w % eq_solref.shape[0], cid]
+      si = eq_solimp[w % eq_solimp.shape[0], cid]
+
+    derivatives = wp.grad(_constraint_contract)(
+      efc_pos_in[w, row] - efc_margin_in[w, row],
+      efc_vel_in[w, row],
+      Z,
+      sr,
+      si,
+      frictionloss,
+      invweight,
+      opt_timestep[w % opt_timestep.shape[0]],
+      opt_disableflags,
+      ty,
+      st,
+      efc_aref_in[w, row],
+      efc_force_in[w, row],
+      efc_D_in[w, row],
+      ctx_Jaref[w, row],
+    )
+    Pb, Vb, Zb = derivatives[0], derivatives[1], derivatives[2]
+    if wp.static(param_grad):
+      if ty == ConstraintType.FRICTION_DOF:
+        if res_dof_solref_out:
+          wp.atomic_add(res_dof_solref_out, w % dof_solref.shape[0], cid, derivatives[3])  # kernel_analyzer: ignore[atomic]
+        if res_dof_solimp_out:
+          wp.atomic_add(res_dof_solimp_out, w % dof_solimp.shape[0], cid, derivatives[4])  # kernel_analyzer: ignore[atomic]
+        if res_dof_frictionloss_out:
+          wp.atomic_add(
+            res_dof_frictionloss_out, w % dof_frictionloss.shape[0], cid, derivatives[5]
+          )  # kernel_analyzer: ignore[atomic]
+      elif ty == ConstraintType.LIMIT_JOINT:
+        if res_jnt_solref_out:
+          wp.atomic_add(res_jnt_solref_out, w % jnt_solref.shape[0], cid, derivatives[3])  # kernel_analyzer: ignore[atomic]
+        if res_jnt_solimp_out:
+          wp.atomic_add(res_jnt_solimp_out, w % jnt_solimp.shape[0], cid, derivatives[4])  # kernel_analyzer: ignore[atomic]
+      else:
+        if res_eq_solref_out:
+          wp.atomic_add(res_eq_solref_out, w % eq_solref.shape[0], cid, derivatives[3])  # kernel_analyzer: ignore[atomic]
+        if res_eq_solimp_out:
+          wp.atomic_add(res_eq_solimp_out, w % eq_solimp.shape[0], cid, derivatives[4])  # kernel_analyzer: ignore[atomic]
+
+    # Friction rows have no position dependence. Nonlinear joint Jacobians add a separate term.
+    route_p = ty == ConstraintType.LIMIT_JOINT or ty == ConstraintType.EQUALITY
+    for k in range(count):
+      i, jj = k, float(0.0)
       if wp.static(is_sparse):
         sid = start + k
         i = efc_J_colind_in[w, 0, sid]
@@ -265,38 +251,32 @@ def _constraint_scatter(is_sparse: bool):
       else:
         jj = efc_J_in[w, row, i]
       if jj != 0.0:
-        wp.atomic_add(res_qvel_out[w], i, jj * Vb)  # kernel_analyzer: ignore[atomic]
+        wp.atomic_add(res_qvel_out, w, i, jj * Vb)  # kernel_analyzer: ignore[atomic]
         if route_p:
-          wp.atomic_add(res_dof_out[w], i, jj * Pb)  # kernel_analyzer: ignore[atomic]
-
+          wp.atomic_add(res_dof_out, w, i, jj * Pb)  # kernel_analyzer: ignore[atomic]
     if not route_p:
       return
-    cid = efc_id_in[w, row]
     jointid = cid
     if ty == ConstraintType.EQUALITY:
       jointid = eq_obj2id[cid]
       if jointid < 0:
         return
-    else:
-      if jnt_type[jointid] != JointType.BALL:
-        return
-
+    elif jnt_type[jointid] != JointType.BALL:
+      return
     qadr, dadr = jnt_qposadr[jointid], jnt_dofadr[jointid]
-    force_seed = adjZ_in[w, row]
-    acceleration_seed = efc_D_in[w, row] * Z_in[w, row]
-    # Each Jacobian column receives Zbar*lambda + Vbar*v + Abar*a.
+    acceleration_bar = efc_D_in[w, row] * Z
     if ty == ConstraintType.EQUALITY:
-      seed = force_seed * lam_in[w, dadr] + Vb * qvel_in[w, dadr] + acceleration_seed * qacc_in[w, dadr]
+      jacobian_bar = Zb * lam[w, dadr] + Vb * qvel_in[w, dadr] + acceleration_bar * qacc_in[w, dadr]
       x = qpos_in[w, qadr] - qpos0[w % qpos0.shape[0], qadr]
-      derivatives = wp.grad(_joint_jacobian_objective)(x, eq_data[w % eq_data.shape[0], cid], seed)
-      wp.atomic_add(res_dof_out, w, dadr, derivatives[0])  # kernel_analyzer: ignore[atomic]
+      jacobian_grad = wp.grad(_joint_jacobian_contract)(x, eq_data[w % eq_data.shape[0], cid], jacobian_bar)[0]
+      wp.atomic_add(res_dof_out, w, dadr, jacobian_grad)  # kernel_analyzer: ignore[atomic]
     else:
-      axis_seed = wp.vec3()
+      axis_bar = wp.vec3()
       for i in range(3):
         dof = dadr + i
-        axis_seed[i] = force_seed * lam_in[w, dof] + Vb * qvel_in[w, dof] + acceleration_seed * qacc_in[w, dof]
+        axis_bar[i] = Zb * lam[w, dof] + Vb * qvel_in[w, dof] + acceleration_bar * qacc_in[w, dof]
       quat = wp.quat(qpos_in[w, qadr], qpos_in[w, qadr + 1], qpos_in[w, qadr + 2], qpos_in[w, qadr + 3])
-      rotation_grad = wp.grad(_ball_jacobian_objective)(wp.vec3(), quat, axis_seed)[0]
+      rotation_grad = wp.grad(_ball_jacobian_contract)(wp.vec3(), quat, axis_bar)[0]
       for i in range(3):
         wp.atomic_add(res_dof_out, w, dadr + i, rotation_grad[i])  # kernel_analyzer: ignore[atomic]
 
@@ -342,9 +322,17 @@ def _proj_row_spatial(Vsp: wp.spatial_vector, fm: wp.mat33, dimid: int) -> float
   return wp.dot(_frame_axis(fm, dimid - 3), wp.spatial_top(Vsp))
 
 
-# pyramidal edge e's projection of a contact-point spatial motion (the summed _edge_coef)
+@wp.func
+def _row_jaref_spatial(
+  A: wp.spatial_vector, V: wp.spatial_vector, fm: wp.mat33, dimid: int, k: float, b: float, imp: float, pos: float
+) -> float:
+  """Returns a contact row's Jaref from contact-point spatial acceleration and velocity."""
+  return _row_jaref(_proj_row_spatial(A, fm, dimid), _proj_row_spatial(V, fm, dimid), k, b, imp, pos)
+
+
 @wp.func
 def _proj_edge_spatial(Vsp: wp.spatial_vector, fm: wp.mat33, fric: vec5, e: int, condim: int) -> float:
+  """Projects a contact-point spatial motion onto pyramidal edge e."""
   c = _proj_row_spatial(Vsp, fm, 0)
   if condim > 1:
     dimid2 = e / 2 + 1
@@ -353,230 +341,199 @@ def _proj_edge_spatial(Vsp: wp.spatial_vector, fm: wp.mat33, fric: vec5, e: int,
   return c
 
 
-# Topology gather: per-contact spatial motions V/A/Z from a symmetric-difference dof walk.
-@wp.kernel(enable_backward=False)
-def _contact_gather(
+@wp.func
+def _contact_force_contract(
+  # In:
+  fm: wp.mat33,
+  fric: vec5,
+  V: wp.spatial_vector,
+  A: wp.spatial_vector,
+  pos: float,
+  dt: float,
+  imp_isq: float,
+  invweight: float,
+  solref: wp.vec2,
+  solreffriction: wp.vec2,
+  solimp: vec5,
+  disableflags: int,
+  condim: int,
+  st: int,
+  active_edges: int,
+  force_bar: vec10,
+  is_elliptic: bool,
+):
+  """Contract the local force law with a fixed row cotangent, preserving the forward branch."""
+  if is_elliptic:
+    if st == ConstraintState.SATISFIED:
+      return 0.0
+  kbimp = constraint._contact_kbimp(disableflags, dt, solref, solimp, pos, False)
+  k = kbimp[0]
+  b = kbimp[1]
+  imp = kbimp[2]
+  D0 = constraint._efc_D(invweight, imp)
+  phi = float(0.0)
+
+  if is_elliptic:
+    ref_t = solref
+    if solreffriction[0] != 0.0 or solreffriction[1] != 0.0:
+      ref_t = solreffriction
+    b_t = constraint._contact_kbimp(disableflags, dt, ref_t, solimp, pos, False)[1]
+    mu = fric[0] * imp_isq
+
+    if (condim > 1) and (st == ConstraintState.CONE):  # middle zone: cone-coupled forces, shared N/T
+      N = _row_jaref_spatial(A, V, fm, 0, k, b, imp, pos) * mu
+      TT = float(0.0)
+      for j in range(1, _MAXCONDIM):
+        if j < condim:
+          tj = _row_jaref_spatial(A, V, fm, j, 0.0, b_t, 0.0, 0.0) * _friction(fric, j - 1)
+          TT += tj * tj
+      T = wp.sqrt(wp.max(TT, MJ_MINVAL * MJ_MINVAL))
+      fn = solver._eval_elliptic_middle(N, T, D0, mu, 0.0, True)[0]
+      phi += fn * force_bar[0]
+      for j in range(1, _MAXCONDIM):
+        if j < condim:
+          frij = _friction(fric, j - 1)
+          uj = _row_jaref_spatial(A, V, fm, j, 0.0, b_t, 0.0, 0.0)
+          fj = solver._eval_elliptic_middle(N, T, D0, mu, uj * frij * frij, False)[0]
+          phi += fj * force_bar[j]
+    else:  # bottom zone / frictionless: each row force = -D_row * Jaref_row
+      f0 = -D0 * _row_jaref_spatial(A, V, fm, 0, k, b, imp, pos)
+      phi += f0 * force_bar[0]
+      imp_isq2 = imp_isq * imp_isq
+      for j in range(1, _MAXCONDIM):
+        if j < condim:
+          scale = imp_isq2
+          if j > 1:
+            frij = _friction(fric, j - 1)
+            scale *= fric[0] * fric[0] / (frij * frij)
+          Dj = D0 / scale
+          fj = -Dj * _row_jaref_spatial(A, V, fm, j, 0.0, b_t, 0.0, 0.0)
+          phi += fj * force_bar[j]
+  else:  # pyramidal: 2*(condim-1) edges (1 if condim==1); each edge an independent force
+    if condim > 1:
+      fri0 = fric[0]
+      invweight = invweight + fri0 * fri0 * invweight
+      invweight = invweight * 2.0 * fri0 * fri0 * imp_isq * imp_isq
+    D = constraint._efc_D(invweight, imp)
+    for e in range(_MAX_PYRAMID_EDGES):
+      # The caller sets bits only for this contact's active edges.
+      if (active_edges & (1 << e)) != 0:
+        Jqve = _proj_edge_spatial(V, fm, fric, e, condim)
+        Jqae = _proj_edge_spatial(A, fm, fric, e, condim)
+        fe = -D * _row_jaref(Jqae, Jqve, k, b, imp, pos)
+        phi += fe * force_bar[e]
+
+  return phi
+
+
+@wp.func
+def _contact_jacobian_contract(
+  # In:
+  fm: wp.mat33,
+  fric: vec5,
+  Z: wp.spatial_vector,
+  force: vec10,
+  condim: int,
+  is_elliptic: bool,
+):
+  """Contract J @ lambda with the recorded force, which is zero on inactive rows."""
+  phi = float(0.0)
+  if is_elliptic:
+    for i in range(_MAXCONDIM):
+      if i < condim:
+        phi -= force[i] * _proj_row_spatial(Z, fm, i)
+  else:
+    rows = 1 if condim == 1 else 2 * (condim - 1)
+    for i in range(_MAX_PYRAMID_EDGES):
+      if i < rows:
+        phi -= force[i] * _proj_edge_spatial(Z, fm, fric, i, condim)
+  return phi
+
+
+@wp.func
+def _contact_material_vjp(
+  # Model:
+  ngeom: int,
+  geom_priority: wp.array[int],
+  geom_friction: wp.array2d[wp.vec3],
+  pair_friction: wp.array2d[vec5],
+  nxn_pairid: wp.array[wp.vec2i],
+  # In:
+  geom: wp.vec2i,
+  w: int,
+  friction_bar: vec5,
+  geom_friction_grad: bool,
+  pair_friction_grad: bool,
+  # Out:
+  geom_friction_grad_out: wp.array2d[wp.vec3],
+  pair_friction_grad_out: wp.array2d[vec5],
+):
+  """Maps contact friction cotangents to geom or explicit-pair parameter gradients."""
+  # Recover the same explicit-pair selection used by the broadphase.
+  pairid = nxn_pairid[math.upper_tri_index(ngeom, wp.min(geom[0], geom[1]), wp.max(geom[0], geom[1]))][0]
+  if pairid >= 0:
+    if pair_friction_grad:
+      pair_worldid = w % pair_friction.shape[0]
+      friction = pair_friction[pair_worldid, pairid]
+      grad = vec5(0.0)
+      for i in range(5):
+        if friction[i] > MJ_MINMU:
+          grad[i] = -friction_bar[i]
+      wp.atomic_add(pair_friction_grad_out, pair_worldid, pairid, grad)  # kernel_analyzer: ignore[atomic]
+  elif geom_friction_grad:
+    grad1, grad2 = model_adjoint.geom_friction_vjp(geom_priority, geom_friction, geom, w, friction_bar)
+    model_worldid = w % geom_friction.shape[0]
+    wp.atomic_add(geom_friction_grad_out, model_worldid, geom[0], grad1)  # kernel_analyzer: ignore[atomic]
+    wp.atomic_add(geom_friction_grad_out, model_worldid, geom[1], grad2)  # kernel_analyzer: ignore[atomic]
+
+
+@wp.func
+def _contact_dof(
   # Model:
   body_rootid: wp.array[int],
-  body_weldid: wp.array[int],
-  body_dofnum: wp.array[int],
-  body_dofadr: wp.array[int],
-  dof_parentid: wp.array[int],
-  geom_bodyid: wp.array[int],
   # Data in:
-  qvel_in: wp.array2d[float],
-  qacc_in: wp.array2d[float],
   subtree_com_in: wp.array2d[wp.vec3],
   cdof_in: wp.array2d[wp.spatial_vector],
-  contact_pos_in: wp.array[wp.vec3],
-  contact_geom_in: wp.array[wp.vec2i],
-  contact_efc_address_in: wp.array2d[int],
-  contact_worldid_in: wp.array[int],
-  nacon_in: wp.array[int],
   # In:
-  lam_in: wp.array2d[float],
-  # Out:
-  V_out: wp.array[wp.spatial_vector],
-  A_out: wp.array[wp.spatial_vector],
-  Z_out: wp.array[wp.spatial_vector],
+  worldid: int,
+  pos: wp.vec3,
+  body0: int,
+  body1: int,
+  dof0: int,
+  dof1: int,
 ):
-  cid = wp.tid()
-  z = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
-  V_out[cid] = z
-  A_out[cid] = z
-  Z_out[cid] = z
-  if cid >= nacon_in[0]:
-    return
-  w = contact_worldid_in[cid]
-  e0 = contact_efc_address_in[cid, 0]
-  if e0 < 0:
-    return
-  # Pyramidal edges have independent states; the cone leaf selects active rows.
-  geom = contact_geom_in[cid]
-  if geom[0] < 0 or geom[1] < 0:  # flex (negative geom ids): unsupported
-    return
-  b0 = body_weldid[geom_bodyid[geom[0]]]
-  b1 = body_weldid[geom_bodyid[geom[1]]]
-  p = contact_pos_in[cid]
-  V = z
-  A = z
-  Z = z
-  d0 = body_dofadr[b0] + body_dofnum[b0] - 1
-  d1 = body_dofadr[b1] + body_dofnum[b1] - 1
-  while d0 >= 0 or d1 >= 0:
-    if d0 == d1:  # reached the common ancestor chain -> all remaining dofs cancel
-      break
-    i = int(0)
-    side = float(0.0)
-    bb = int(0)
-    if d1 > d0:
-      i = d1
-      side = 1.0
-      bb = b1
-      d1 = dof_parentid[d1]
-    else:
-      i = d0
-      side = -1.0
-      bb = b0
-      d0 = dof_parentid[d0]
-    cdof = cdof_in[w, i]
-    a = wp.spatial_top(cdof)
-    lin = wp.spatial_bottom(cdof)
-    off = p - subtree_com_in[w, body_rootid[bb]]
-    jacp = lin + wp.cross(a, off)
-    h = wp.spatial_vector(side * a, side * jacp)  # top=angular, bottom=linear (cdof convention)
-    V += h * qvel_in[w, i]
-    A += h * qacc_in[w, i]
-    Z += h * lam_in[w, i]
-  V_out[cid] = V
-  A_out[cid] = A
-  Z_out[cid] = Z
+  """Returns the next contact dof, its sign, root, COM offset and unsigned Jacobian column."""
+  dofid = dof0
+  side = -1.0
+  body = body0
+  if dof1 > dof0:
+    dofid = dof1
+    side = 1.0
+    body = body1
+  root = body_rootid[body]
+  offset = pos - subtree_com_in[worldid, root]
+  cdof = cdof_in[worldid, dofid]
+  jacr = wp.spatial_top(cdof)
+  return dofid, side, root, offset, wp.spatial_vector(jacr, wp.spatial_bottom(cdof) + wp.cross(jacr, offset))
 
 
-# loop-free source-AD cone leaf (one thread per contact): phi_c = lam^T r_c = -Z*F(V,A,xi)
 @cache_kernel
-def _contact_phi(cone_type: int):
+def _contact_residual(cone_type: int, geom_friction_grad: bool, pair_friction_grad: bool):
+  """Gathers, differentiates and scatters one contact with scalar generated adjoints."""
   IS_ELLIPTIC = cone_type == ConeType.ELLIPTIC
 
-  @wp.kernel(module="unique", enable_backward=True)
-  def kernel(
-    # Model:
-    opt_timestep: wp.array[float],
-    opt_disableflags: int,
-    opt_impratio_invsqrt: wp.array[float],
-    body_invweight0: wp.array2d[wp.vec2],
-    geom_bodyid: wp.array[int],
-    # Data in:
-    contact_frame_in: wp.array[wp.mat33],
-    contact_friction_in: wp.array[vec5],
-    contact_solref_in: wp.array[wp.vec2],
-    contact_solreffriction_in: wp.array[wp.vec2],
-    contact_solimp_in: wp.array[vec5],
-    contact_dim_in: wp.array[int],
-    contact_geom_in: wp.array[wp.vec2i],
-    contact_efc_address_in: wp.array2d[int],
-    contact_worldid_in: wp.array[int],
-    efc_pos_in: wp.array2d[float],
-    efc_margin_in: wp.array2d[float],
-    efc_state_in: wp.array2d[int],
-    nacon_in: wp.array[int],
-    # In:
-    V_in: wp.array[wp.spatial_vector],
-    A_in: wp.array[wp.spatial_vector],  # qacc frozen, but A feeds the qacc->cdof scatter path
-    Z_in: wp.array[wp.spatial_vector],  # = Jlam; Zbar = -F carries the direct -J^Tf projection
-    # Out:
-    phi_out: wp.array[float],
-  ):
-    cid = wp.tid()
-    phi_out[cid] = 0.0
-    if cid >= nacon_in[0]:
-      return
-    w = contact_worldid_in[cid]
-    e0 = contact_efc_address_in[cid, 0]
-    if e0 < 0:
-      return
-    geom = contact_geom_in[cid]
-    if geom[0] < 0 or geom[1] < 0:
-      return
-    st = efc_state_in[w, e0]
-    if wp.static(IS_ELLIPTIC):
-      if st == ConstraintState.SATISFIED:
-        return
-    dt = opt_timestep[w % opt_timestep.shape[0]]
-    imp_isq = opt_impratio_invsqrt[w % opt_impratio_invsqrt.shape[0]]
-    condim = contact_dim_in[cid]
-    fm = contact_frame_in[cid]
-    fric = contact_friction_in[cid]
-    solref = contact_solref_in[cid]
-    solimp = contact_solimp_in[cid]
-    pos = efc_pos_in[w, e0] - efc_margin_in[w, e0]  # differentiable penetration (-> res_efc_pos)
-    kbimp = constraint._contact_kbimp(opt_disableflags, dt, solref, solimp, pos, False)
-    k = kbimp[0]
-    b = kbimp[1]
-    imp = kbimp[2]
-    # Match the rigid-contact weights in constraint._efc_contact_update.
-    model_worldid = w % body_invweight0.shape[0]
-    invweight = (
-      body_invweight0[model_worldid, geom_bodyid[geom[0]]][0] + body_invweight0[model_worldid, geom_bodyid[geom[1]]][0]
-    )
-    D0 = constraint._efc_D(invweight, imp)
-    V = V_in[cid]
-    A = A_in[cid]
-    Z = Z_in[cid]
-    phi = float(0.0)
-
-    if wp.static(IS_ELLIPTIC):
-      ref_t = solref
-      solreffriction = contact_solreffriction_in[cid]
-      if solreffriction[0] != 0.0 or solreffriction[1] != 0.0:
-        ref_t = solreffriction
-      b_t = constraint._contact_kbimp(opt_disableflags, dt, ref_t, solimp, pos, False)[1]
-      mu = fric[0] * imp_isq
-
-      if (condim > 1) and (st == ConstraintState.CONE):  # middle zone: cone-coupled forces, shared N/T
-        N = _row_jaref(_proj_row_spatial(A, fm, 0), _proj_row_spatial(V, fm, 0), k, b, imp, pos) * mu
-        TT = float(0.0)
-        for j in range(1, _MAXCONDIM):
-          if j < condim:
-            uj = _row_jaref(_proj_row_spatial(A, fm, j), _proj_row_spatial(V, fm, j), 0.0, b_t, 0.0, 0.0) * _friction(
-              fric, j - 1
-            )
-            TT += uj * uj
-        T = wp.sqrt(wp.max(TT, MJ_MINVAL * MJ_MINVAL))
-        fn = solver._eval_elliptic_middle(N, T, D0, mu, 0.0, True)[0]
-        phi += -fn * _proj_row_spatial(Z, fm, 0)
-        for j in range(1, _MAXCONDIM):
-          if j < condim:
-            frij = _friction(fric, j - 1)
-            uj = _row_jaref(_proj_row_spatial(A, fm, j), _proj_row_spatial(V, fm, j), 0.0, b_t, 0.0, 0.0)
-            fj = solver._eval_elliptic_middle(N, T, D0, mu, uj * frij * frij, False)[0]
-            phi += -fj * _proj_row_spatial(Z, fm, j)
-      else:  # bottom zone / frictionless: each row force = -D_row * Jaref_row
-        f0 = -D0 * _row_jaref(_proj_row_spatial(A, fm, 0), _proj_row_spatial(V, fm, 0), k, b, imp, pos)
-        phi += -f0 * _proj_row_spatial(Z, fm, 0)
-        for j in range(1, _MAXCONDIM):
-          if j < condim:
-            scale = imp_isq * imp_isq
-            if j > 1:
-              friction = _friction(fric, j - 1)
-              scale *= fric[0] * fric[0] / (friction * friction)
-            Dj = D0 / scale
-            fj = -Dj * _row_jaref(_proj_row_spatial(A, fm, j), _proj_row_spatial(V, fm, j), 0.0, b_t, 0.0, 0.0)
-            phi += -fj * _proj_row_spatial(Z, fm, j)
-    else:  # pyramidal: ndim = 2*(condim-1) edges (1 if condim==1); each edge an independent force
-      ndim = int(1)
-      if condim > 1:
-        ndim = 2 * (condim - 1)
-        friction = fric[0]
-        invweight = invweight + friction * friction * invweight
-        invweight = invweight * 2.0 * friction * friction * imp_isq * imp_isq
-      D = constraint._efc_D(invweight, imp)
-      for e in range(_MAX_PYRAMID_EDGES):
-        if e < ndim:
-          ea = contact_efc_address_in[cid, e]
-          if ea >= 0 and efc_state_in[w, ea] != ConstraintState.SATISFIED:
-            Jqve = _proj_edge_spatial(V, fm, fric, e, condim)
-            Jqae = _proj_edge_spatial(A, fm, fric, e, condim)
-            fe = -D * _row_jaref(Jqae, Jqve, k, b, imp, pos)
-            phi += -fe * _proj_edge_spatial(Z, fm, fric, e, condim)
-
-    phi_out[cid] = phi
-
-  return kernel
-
-
-# Topology scatter: route leaf adjoints over the gather's symmetric-difference walk. qacc is the
-# implicit root, but its Abar term still feeds cdof/com through cdof(qpos).
-@cache_kernel
-def _contact_scatter(geom_friction_grad: bool, pair_friction_grad: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
     ngeom: int,
+    opt_timestep: wp.array[float],
+    opt_disableflags: int,
+    opt_impratio_invsqrt: wp.array[float],
     body_rootid: wp.array[int],
     body_weldid: wp.array[int],
     body_dofnum: wp.array[int],
     body_dofadr: wp.array[int],
+    body_invweight0: wp.array2d[wp.vec2],
     dof_parentid: wp.array[int],
     geom_bodyid: wp.array[int],
     geom_priority: wp.array[int],
@@ -589,21 +546,29 @@ def _contact_scatter(geom_friction_grad: bool, pair_friction_grad: bool):
     subtree_com_in: wp.array2d[wp.vec3],
     cdof_in: wp.array2d[wp.spatial_vector],
     contact_pos_in: wp.array[wp.vec3],
+    contact_frame_in: wp.array[wp.mat33],
+    contact_friction_in: wp.array[vec5],
+    contact_solref_in: wp.array[wp.vec2],
+    contact_solreffriction_in: wp.array[wp.vec2],
+    contact_solimp_in: wp.array[vec5],
+    contact_dim_in: wp.array[int],
     contact_geom_in: wp.array[wp.vec2i],
     contact_efc_address_in: wp.array2d[int],
     contact_worldid_in: wp.array[int],
+    efc_pos_in: wp.array2d[float],
+    efc_margin_in: wp.array2d[float],
+    efc_force_in: wp.array2d[float],
+    efc_state_in: wp.array2d[int],
     nacon_in: wp.array[int],
     # In:
-    lam_in: wp.array2d[float],
-    adjV_in: wp.array[wp.spatial_vector],
-    adjA_in: wp.array[wp.spatial_vector],
-    adjZ_in: wp.array[wp.spatial_vector],
-    res_contact_friction_in: wp.array[vec5],
+    lam: wp.array2d[float],
     # Out:
     res_qvel_out: wp.array2d[float],
     res_cdof_out: wp.array2d[wp.spatial_vector],
     res_subtree_com_out: wp.array2d[wp.vec3],
     res_contact_pos_out: wp.array[wp.vec3],
+    res_contact_frame_out: wp.array[wp.mat33],
+    res_efc_pos_out: wp.array2d[float],
     geom_friction_grad_out: wp.array2d[wp.vec3],
     pair_friction_grad_out: wp.array2d[vec5],
   ):
@@ -617,63 +582,118 @@ def _contact_scatter(geom_friction_grad: bool, pair_friction_grad: bool):
     geom = contact_geom_in[cid]
     if geom[0] < 0 or geom[1] < 0:
       return
-    if wp.static(geom_friction_grad or pair_friction_grad):
-      # Recover the same explicit-pair selection used by the broadphase.
-      pairid = nxn_pairid[math.upper_tri_index(ngeom, wp.min(geom[0], geom[1]), wp.max(geom[0], geom[1]))][0]
-      if pairid >= 0:
-        if wp.static(pair_friction_grad):
-          pair_worldid = w % pair_friction.shape[0]
-          friction = pair_friction[pair_worldid, pairid]
-          grad = vec5(0.0)
-          for i in range(5):
-            if friction[i] > MJ_MINMU:
-              grad[i] = -res_contact_friction_in[cid][i]
-          wp.atomic_add(pair_friction_grad_out, pair_worldid, pairid, grad)  # kernel_analyzer: ignore[atomic]
-      elif wp.static(geom_friction_grad):
-        grad1, grad2 = model_adjoint.geom_friction_vjp(geom_priority, geom_friction, geom, w, res_contact_friction_in[cid])
-        model_worldid = w % geom_friction.shape[0]
-        wp.atomic_add(geom_friction_grad_out, model_worldid, geom[0], grad1)  # kernel_analyzer: ignore[atomic]
-        wp.atomic_add(geom_friction_grad_out, model_worldid, geom[1], grad2)  # kernel_analyzer: ignore[atomic]
+    st = efc_state_in[w, e0]
+    condim = contact_dim_in[cid]
+    active_edges = int(0)
+    if wp.static(IS_ELLIPTIC):
+      if st == ConstraintState.SATISFIED:
+        return
+    else:
+      ndim = 1 if condim == 1 else 2 * (condim - 1)
+      for edge in range(_MAX_PYRAMID_EDGES):
+        if edge < ndim:
+          row = contact_efc_address_in[cid, edge]
+          if row >= 0 and efc_state_in[w, row] != ConstraintState.SATISFIED:
+            active_edges = active_edges | (1 << edge)
+      if active_edges == 0:
+        return
+
+    # Gather spatial velocity (V), acceleration (A), and cotangent (Z) at the contact point.
     b0 = body_weldid[geom_bodyid[geom[0]]]
     b1 = body_weldid[geom_bodyid[geom[1]]]
     p = contact_pos_in[cid]
-    Vb = adjV_in[cid]
-    Ab = adjA_in[cid]
-    Zb = adjZ_in[cid]
+    V = wp.spatial_vector()
+    A = wp.spatial_vector()
+    Z = wp.spatial_vector()
+    d0 = body_dofadr[b0] + body_dofnum[b0] - 1
+    d1 = body_dofadr[b1] + body_dofnum[b1] - 1
+    while wp.max(d0, d1) >= 0 and d0 != d1:  # dofs shared by both chains cancel
+      i, side, root, off, column = _contact_dof(body_rootid, subtree_com_in, cdof_in, w, p, b0, b1, d0, d1)
+      h = side * column  # top=angular, bottom=linear (cdof convention)
+      V += h * qvel_in[w, i]
+      A += h * qacc_in[w, i]
+      Z += h * lam[w, i]
+      d0, d1 = constraint._dof_chain_advance(dof_parentid, d0, d1, 1)
+
+    # Differentiate phi with Warp's generated adjoint.
+    dt = opt_timestep[w % opt_timestep.shape[0]]
+    imp_isq = opt_impratio_invsqrt[w % opt_impratio_invsqrt.shape[0]]
+    model_worldid = w % body_invweight0.shape[0]
+    invweight = (
+      body_invweight0[model_worldid, geom_bodyid[geom[0]]][0] + body_invweight0[model_worldid, geom_bodyid[geom[1]]][0]
+    )
+    # Product rule for -J.T @ f: differentiate J with the recorded force, then
+    # differentiate the local force law with its cotangent -J @ lambda.
+    frame = contact_frame_in[cid]
+    friction = contact_friction_in[cid]
+    force_ref = vec10()
+    for i in range(contact_efc_address_in.shape[1]):
+      row = contact_efc_address_in[cid, i]
+      if row >= 0:
+        force_ref[i] = efc_force_in[w, row]
+    jacobian_derivatives = wp.grad(_contact_jacobian_contract)(frame, friction, Z, force_ref, condim, wp.static(IS_ELLIPTIC))
+    force_derivatives = wp.grad(_contact_force_contract)(
+      frame,
+      friction,
+      V,
+      A,
+      efc_pos_in[w, e0] - efc_margin_in[w, e0],
+      dt,
+      imp_isq,
+      invweight,
+      contact_solref_in[cid],
+      contact_solreffriction_in[cid],
+      contact_solimp_in[cid],
+      opt_disableflags,
+      condim,
+      st,
+      active_edges,
+      jacobian_derivatives[3],
+      wp.static(IS_ELLIPTIC),
+    )
+    frame_bar = force_derivatives[0] + jacobian_derivatives[0]
+    friction_bar = force_derivatives[1] + jacobian_derivatives[1]
+    Vb, Ab, Zb = force_derivatives[2], force_derivatives[3], jacobian_derivatives[2]
+    pos_bar = force_derivatives[4]
+    res_contact_frame_out[cid] += frame_bar
+    wp.atomic_add(res_efc_pos_out, w, e0, pos_bar)  # kernel_analyzer: ignore[atomic]
+    if wp.static(geom_friction_grad or pair_friction_grad):
+      _contact_material_vjp(
+        ngeom,
+        geom_priority,
+        geom_friction,
+        pair_friction,
+        nxn_pairid,
+        geom,
+        w,
+        friction_bar,
+        wp.static(geom_friction_grad),
+        wp.static(pair_friction_grad),
+        geom_friction_grad_out,
+        pair_friction_grad_out,
+      )
+
+    # Reload contact geometry to keep register lifetimes short, then scatter over the same DOFs.
+    b0 = body_weldid[geom_bodyid[geom[0]]]
+    b1 = body_weldid[geom_bodyid[geom[1]]]
+    p = contact_pos_in[cid]
     cpos_acc = wp.vec3(0.0)
     d0 = body_dofadr[b0] + body_dofnum[b0] - 1
     d1 = body_dofadr[b1] + body_dofnum[b1] - 1
-    while d0 >= 0 or d1 >= 0:
-      if d0 == d1:
-        break
-      i = int(0)
-      side = float(0.0)
-      bb = int(0)
-      if d1 > d0:
-        i = d1
-        side = 1.0
-        bb = b1
-        d1 = dof_parentid[d1]
-      else:
-        i = d0
-        side = -1.0
-        bb = b0
-        d0 = dof_parentid[d0]
-      cdof = cdof_in[w, i]
-      a = wp.spatial_top(cdof)
-      lin = wp.spatial_bottom(cdof)
-      off = p - subtree_com_in[w, body_rootid[bb]]
-      jacp = lin + wp.cross(a, off)
-      h = wp.spatial_vector(side * a, side * jacp)
+    while wp.max(d0, d1) >= 0 and d0 != d1:
+      i, side, root, off, column = _contact_dof(body_rootid, subtree_com_in, cdof_in, w, p, b0, b1, d0, d1)
+      a = wp.spatial_top(column)
+      h = side * column
       # dphi/dqvel_i = h_i*Vbar
-      wp.atomic_add(res_qvel_out[w], i, wp.dot(h, Vb))  # kernel_analyzer: ignore[atomic]
-      G = side * (qvel_in[w, i] * Vb + qacc_in[w, i] * Ab + lam_in[w, i] * Zb)  # cotangent on raw jac column
+      wp.atomic_add(res_qvel_out, w, i, wp.dot(h, Vb))  # kernel_analyzer: ignore[atomic]
+      G = side * (qvel_in[w, i] * Vb + qacc_in[w, i] * Ab + lam[w, i] * Zb)  # cotangent on raw jac column
       Ga = wp.spatial_top(G)
       Gl = wp.spatial_bottom(G)
-      wp.atomic_add(res_cdof_out[w], i, wp.spatial_vector(Ga + wp.cross(off, Gl), Gl))  # kernel_analyzer: ignore[atomic]
+      wp.atomic_add(res_cdof_out, w, i, wp.spatial_vector(Ga + wp.cross(off, Gl), Gl))  # kernel_analyzer: ignore[atomic]
       cpos_acc += wp.cross(Gl, a)  # d(off=p-com)/dp
       # doff/dcom = -doff/dp
-      wp.atomic_add(res_subtree_com_out[w], body_rootid[bb], wp.cross(a, Gl))  # kernel_analyzer: ignore[atomic]
+      wp.atomic_add(res_subtree_com_out, w, root, wp.cross(a, Gl))  # kernel_analyzer: ignore[atomic]
+      d0, d1 = constraint._dof_chain_advance(dof_parentid, d0, d1, 1)
     res_contact_pos_out[cid] += cpos_acc
 
   return kernel

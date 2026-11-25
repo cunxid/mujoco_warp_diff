@@ -16,8 +16,8 @@
 
 import warp as wp
 
-from mujoco_warp._src import adjoint_recompute
 from mujoco_warp._src import math
+from mujoco_warp._src import smooth
 from mujoco_warp._src.types import MJ_MINMU
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import BackwardContext
@@ -87,17 +87,26 @@ def _accum_constraint_params(
   return kernel
 
 
+@wp.func
+def _inertial_frame_contract(ipos: wp.vec3, iquat: wp.quat, rotation: wp.quat, pos_bar: wp.vec3, quat_bar: wp.quat):
+  phi = wp.dot(math.rot_vec_quat(ipos, rotation), pos_bar)
+  return phi + wp.dot(math.mul_quat(rotation, iquat), quat_bar)
+
+
 @cache_kernel
-def _accum_inertial_params(
-  body_mass_grad: bool, body_inertia_grad: bool, body_ipos_grad: bool, body_iquat_grad: bool, scale: float
-):
+def _inertia_vjp(body_mass_grad: bool, body_inertia_grad: bool, body_ipos_grad: bool, body_iquat_grad: bool, scale: float):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
+    # Model:
+    body_ipos: wp.array2d[wp.vec3],
+    body_iquat: wp.array2d[wp.quat],
+    # Data in:
+    xquat_in: wp.array2d[wp.quat],
     # In:
+    adj_xipos: wp.array2d[wp.vec3],
+    adj_xiquat: wp.array2d[wp.quat],
     res_body_mass: wp.array2d[float],
     res_body_inertia: wp.array2d[wp.vec3],
-    res_body_ipos: wp.array2d[wp.vec3],
-    res_body_iquat: wp.array2d[wp.quat],
     # Out:
     body_mass_grad_out: wp.array2d[float],
     body_inertia_grad_out: wp.array2d[wp.vec3],
@@ -111,12 +120,23 @@ def _accum_inertial_params(
     if wp.static(body_inertia_grad):
       if worldid < res_body_inertia.shape[0]:
         body_inertia_grad_out[worldid, bodyid] += wp.static(scale) * res_body_inertia[worldid, bodyid]
-    if wp.static(body_ipos_grad):
-      if worldid < res_body_ipos.shape[0]:
-        body_ipos_grad_out[worldid, bodyid] += wp.static(scale) * res_body_ipos[worldid, bodyid]
-    if wp.static(body_iquat_grad):
-      if worldid < res_body_iquat.shape[0]:
-        body_iquat_grad_out[worldid, bodyid] += wp.static(scale) * res_body_iquat[worldid, bodyid]
+    if wp.static(body_ipos_grad or body_iquat_grad):
+      if worldid < xquat_in.shape[0]:
+        gradients = wp.grad(_inertial_frame_contract)(
+          body_ipos[worldid % body_ipos.shape[0], bodyid],
+          body_iquat[worldid % body_iquat.shape[0], bodyid],
+          xquat_in[worldid, bodyid],
+          adj_xipos[worldid, bodyid],
+          adj_xiquat[worldid, bodyid],
+        )
+        if wp.static(body_ipos_grad):
+          wp.atomic_add(
+            body_ipos_grad_out, worldid % body_ipos.shape[0], bodyid, wp.static(scale) * gradients[0]
+          )  # kernel_analyzer: ignore[atomic]
+        if wp.static(body_iquat_grad):
+          wp.atomic_add(
+            body_iquat_grad_out, worldid % body_iquat.shape[0], bodyid, wp.static(scale) * gradients[1]
+          )  # kernel_analyzer: ignore[atomic]
 
   return kernel
 
@@ -163,15 +183,12 @@ def geom_friction_vjp(
   # In:
   geom: wp.vec2i,
   worldid: int,
-  res_contact_friction: vec5,
+  friction_bar: vec5,
 ) -> tuple[wp.vec3, wp.vec3]:
+  """Returns both geoms' friction gradients for a contact friction cotangent, with the IFT sign."""
   geom1 = geom[0]
   geom2 = geom[1]
-  res_geom_friction = wp.vec3(
-    res_contact_friction[0] + res_contact_friction[1],
-    res_contact_friction[2],
-    res_contact_friction[3] + res_contact_friction[4],
-  )
+  geom_friction_bar = wp.vec3(friction_bar[0] + friction_bar[1], friction_bar[2], friction_bar[3] + friction_bar[4])
   model_worldid = worldid % geom_friction.shape[0]
   priority1 = geom_priority[geom1]
   priority2 = geom_priority[geom2]
@@ -182,10 +199,10 @@ def geom_friction_vjp(
   for i in range(3):
     if priority1 > priority2 or (priority1 == priority2 and friction1[i] >= friction2[i]):
       if friction1[i] > MJ_MINMU:
-        grad1[i] = res_geom_friction[i]
+        grad1[i] = geom_friction_bar[i]
     else:
       if friction2[i] > MJ_MINMU:
-        grad2[i] = res_geom_friction[i]
+        grad2[i] = geom_friction_bar[i]
   return -grad1, -grad2
 
 
@@ -193,7 +210,7 @@ def geom_friction_vjp(
 
 
 @wp.func
-def _free_gyro_objective(
+def _free_gyro_contract(
   # In:
   mass: float,
   inertia: wp.mat33,
@@ -201,16 +218,16 @@ def _free_gyro_objective(
   offset: wp.vec3,
   velocity: wp.vec3,
   acceleration: wp.vec3,
-  linear_seed: wp.vec3,
-  angular_seed: wp.vec3,
+  linear_bar: wp.vec3,
+  angular_bar: wp.vec3,
   timestep: float,
 ):
   lin, rot = math.free_bias_vel_blocks(mass, rotation, inertia, offset, velocity)
-  return timestep * (wp.dot(angular_seed, rot @ acceleration) - mass * wp.dot(linear_seed, lin @ acceleration))
+  return timestep * (wp.dot(angular_bar, rot @ acceleration) - mass * wp.dot(linear_bar, lin @ acceleration))
 
 
 @wp.func
-def _inertial_objective(
+def _inertial_contract(
   # In:
   mass: float,
   inertia: wp.vec3,
@@ -221,18 +238,18 @@ def _inertial_objective(
   com: wp.vec3,
   com_mass: float,
   is_root: bool,
-  inertia_seed: vec10,
-  com_seed: wp.vec3,
+  cinert_bar: vec10,
+  com_bar: wp.vec3,
 ):
   world_pos = position + math.rot_vec_quat(ipos, orientation)
   world_mat = math.quat_to_mat(math.mul_quat(orientation, iquat))
-  value = wp.dot(math.inert_com(mass, inertia, world_mat, world_pos - com), inertia_seed)
+  phi = wp.dot(smooth.inert_com(mass, inertia, world_mat, world_pos - com), cinert_bar)
   weight = mass / com_mass if com_mass >= MJ_MINVAL else float(is_root)
-  return value + weight * wp.dot(com_seed, world_pos)
+  return phi + weight * wp.dot(com_bar, world_pos)
 
 
 @cache_kernel
-def _free_gyro_param_vjp(mass_grad: bool, inertia_grad: bool, ipos_grad: bool, iquat_grad: bool):
+def _free_gyro_vjp(body_mass_grad: bool, body_inertia_grad: bool, body_ipos_grad: bool, body_iquat_grad: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
@@ -249,17 +266,16 @@ def _free_gyro_param_vjp(mass_grad: bool, inertia_grad: bool, ipos_grad: bool, i
     qvel_in: wp.array2d[float],
     xpos_in: wp.array2d[wp.vec3],
     xquat_in: wp.array2d[wp.quat],
-    xmat_in: wp.array2d[wp.mat33],
     subtree_com_in: wp.array2d[wp.vec3],
     crb_in: wp.array2d[vec10],
     # In:
     acceleration: wp.array2d[float],
     y: wp.array2d[float],
     # Out:
-    mass_out: wp.array2d[float],
-    inertia_out: wp.array2d[wp.vec3],
-    ipos_out: wp.array2d[wp.vec3],
-    iquat_out: wp.array2d[wp.quat],
+    body_mass_grad_out: wp.array2d[float],
+    body_inertia_grad_out: wp.array2d[wp.vec3],
+    body_ipos_grad_out: wp.array2d[wp.vec3],
+    body_iquat_grad_out: wp.array2d[wp.quat],
   ):
     w, freeid = wp.tid()
     root = body_freeadr[freeid]
@@ -267,10 +283,10 @@ def _free_gyro_param_vjp(mass_grad: bool, inertia_grad: bool, ipos_grad: bool, i
     ci = crb_in[w, root]
     inertia = wp.mat33(ci[0], ci[3], ci[4], ci[3], ci[1], ci[5], ci[4], ci[5], ci[2])
     com = subtree_com_in[w, root]
-    gradients = wp.grad(_free_gyro_objective)(
+    gradients = wp.grad(_free_gyro_contract)(
       ci[9],
       inertia,
-      xmat_in[w, root],
+      math.quat_to_mat(xquat_in[w, root]),
       com - xpos_in[w, root],
       wp.vec3(qvel_in[w, adr + 3], qvel_in[w, adr + 4], qvel_in[w, adr + 5]),
       wp.vec3(acceleration[w, adr + 3], acceleration[w, adr + 4], acceleration[w, adr + 5]),
@@ -279,7 +295,7 @@ def _free_gyro_param_vjp(mass_grad: bool, inertia_grad: bool, ipos_grad: bool, i
       opt_timestep[w % opt_timestep.shape[0]],
     )
     ibar = gradients[1]
-    inertia_seed = vec10(
+    cinert_bar = vec10(
       ibar[0, 0],
       ibar[1, 1],
       ibar[2, 2],
@@ -292,12 +308,12 @@ def _free_gyro_param_vjp(mass_grad: bool, inertia_grad: bool, ipos_grad: bool, i
       gradients[0],
     )
     # Moving the COM also translates every body's parallel-axis inertia.
-    com_seed = gradients[3] + (ibar + wp.transpose(ibar) - 2.0 * wp.trace(ibar) * wp.identity(n=3, dtype=float)) @ wp.vec3(
+    com_bar = gradients[3] + (ibar + wp.transpose(ibar) - 2.0 * wp.trace(ibar) * wp.identity(n=3, dtype=float)) @ wp.vec3(
       ci[6], ci[7], ci[8]
     )
     com_mass = body_subtreemass[w % body_subtreemass.shape[0], root]
     for b in range(root, root + body_subtreenum[root]):
-      values = wp.grad(_inertial_objective)(
+      values = wp.grad(_inertial_contract)(
         body_mass[w % body_mass.shape[0], b],
         body_inertia[w % body_inertia.shape[0], b],
         body_ipos[w % body_ipos.shape[0], b],
@@ -307,29 +323,29 @@ def _free_gyro_param_vjp(mass_grad: bool, inertia_grad: bool, ipos_grad: bool, i
         com,
         com_mass,
         b == root,
-        inertia_seed,
-        com_seed,
+        cinert_bar,
+        com_bar,
       )
       # A = M + dt*D + G: the direct solve contributes -y.T @ dG @ acceleration.
-      if wp.static(mass_grad):
-        wp.atomic_sub(mass_out, w % mass_out.shape[0], b, values[0])  # kernel_analyzer: ignore[atomic]
-      if wp.static(inertia_grad):
-        wp.atomic_sub(inertia_out, w % inertia_out.shape[0], b, values[1])  # kernel_analyzer: ignore[atomic]
-      if wp.static(ipos_grad):
-        wp.atomic_sub(ipos_out, w % ipos_out.shape[0], b, values[2])  # kernel_analyzer: ignore[atomic]
-      if wp.static(iquat_grad):
-        wp.atomic_sub(iquat_out, w % iquat_out.shape[0], b, values[3])  # kernel_analyzer: ignore[atomic]
+      if wp.static(body_mass_grad):
+        wp.atomic_sub(body_mass_grad_out, w % body_mass.shape[0], b, values[0])  # kernel_analyzer: ignore[atomic]
+      if wp.static(body_inertia_grad):
+        wp.atomic_sub(body_inertia_grad_out, w % body_inertia.shape[0], b, values[1])  # kernel_analyzer: ignore[atomic]
+      if wp.static(body_ipos_grad):
+        wp.atomic_sub(body_ipos_grad_out, w % body_ipos.shape[0], b, values[2])  # kernel_analyzer: ignore[atomic]
+      if wp.static(body_iquat_grad):
+        wp.atomic_sub(body_iquat_grad_out, w % body_iquat.shape[0], b, values[3])  # kernel_analyzer: ignore[atomic]
 
   return kernel
 
 
-def implicitfast_inertia_vjp(m: Model, d: Data, acceleration: wp.array, y: wp.array):
-  """Accumulates free-subtree gyroscopic matrix derivatives without a second dynamics reverse."""
+def free_gyro_vjp(m: Model, d: Data, acceleration: wp.array, y: wp.array):
+  """Accumulates inertial parameter cotangents from the free-body gyroscopic matrix."""
   params = (m.body_mass, m.body_inertia, m.body_ipos, m.body_iquat)
   if not any(param.requires_grad for param in params):
     return
   wp.launch(
-    _free_gyro_param_vjp(*(param.requires_grad for param in params)),
+    _free_gyro_vjp(*(param.requires_grad for param in params)),
     dim=(d.nworld, m.body_freeadr.size),
     inputs=[
       m.opt.timestep,
@@ -344,7 +360,6 @@ def implicitfast_inertia_vjp(m: Model, d: Data, acceleration: wp.array, y: wp.ar
       d.qvel,
       d.xpos,
       d.xquat,
-      d.xmat,
       d.subtree_com,
       d.crb,
       acceleration,
@@ -354,8 +369,27 @@ def implicitfast_inertia_vjp(m: Model, d: Data, acceleration: wp.array, y: wp.ar
   )
 
 
-@wp.kernel(enable_backward=True)
-def _smooth_param_contraction(
+@wp.func
+def _smooth_param_contract(
+  # In:
+  armature: float,
+  damping: float,
+  velocity: float,
+  acceleration: float,
+  lam: float,
+  y: float,
+  w_dir: float,
+  damper_enabled: bool,
+):
+  """Contracts the smooth force and direct integration terms for one DOF."""
+  phi = armature * (lam * acceleration - y * w_dir)
+  if damper_enabled:
+    phi += damping * lam * velocity
+  return phi
+
+
+@wp.kernel(enable_backward=False)
+def _smooth_param_vjp(
   # Model:
   opt_disableflags: int,
   dof_armature: wp.array2d[float],
@@ -366,23 +400,36 @@ def _smooth_param_contraction(
   # In:
   lam: wp.array2d[float],
   y: wp.array2d[float],
-  w: wp.array2d[float],
+  w_dir: wp.array2d[float],
   # Out:
-  contraction_out: wp.array2d[float],
+  dof_armature_grad_out: wp.array2d[float],
+  dof_damping_grad_out: wp.array2d[float],
 ):
   worldid, dofid = wp.tid()
-  seed = lam[worldid, dofid]
-  # y and w are zero without an implicit integration solve.
-  value = dof_armature[worldid % dof_armature.shape[0], dofid] * (
-    seed * qacc_in[worldid, dofid] - y[worldid, dofid] * w[worldid, dofid]
+  # y and w_dir are zero without an implicit integration solve.
+  derivatives = wp.grad(_smooth_param_contract)(
+    dof_armature[worldid % dof_armature.shape[0], dofid],
+    dof_damping[worldid % dof_damping.shape[0], dofid],
+    qvel_in[worldid, dofid],
+    qacc_in[worldid, dofid],
+    lam[worldid, dofid],
+    y[worldid, dofid],
+    w_dir[worldid, dofid],
+    (opt_disableflags & DisableBit.DAMPER) == 0,
   )
-  if not (opt_disableflags & DisableBit.DAMPER):
-    value += dof_damping[worldid % dof_damping.shape[0], dofid] * seed * qvel_in[worldid, dofid]
-  contraction_out[worldid, dofid] = value
+  # Parameter writeback subtracts the residual cotangent.
+  if dof_armature_grad_out:
+    wp.atomic_sub(
+      dof_armature_grad_out, worldid % dof_armature.shape[0], dofid, derivatives[0]
+    )  # kernel_analyzer: ignore[atomic]
+  if dof_damping_grad_out:
+    wp.atomic_sub(
+      dof_damping_grad_out, worldid % dof_damping.shape[0], dofid, derivatives[1]
+    )  # kernel_analyzer: ignore[atomic]
 
 
 @event_scope
-def inertia_param_vjp(m: Model, d: Data, bc: BackwardContext, scale: float = -1.0):
+def inertia_vjp(m: Model, d: Data, bc: BackwardContext, scale: float = -1.0):
   """Accumulates inertial parameter cotangents produced by the position reverse."""
   body_mass_grad = m.body_mass.requires_grad
   body_inertia_grad = m.body_inertia.requires_grad
@@ -390,24 +437,13 @@ def inertia_param_vjp(m: Model, d: Data, bc: BackwardContext, scale: float = -1.
   body_iquat_grad = m.body_iquat.requires_grad
   if not (body_mass_grad or body_inertia_grad or body_ipos_grad or body_iquat_grad):
     return
-  if body_ipos_grad or body_iquat_grad:
-    bc.res_body_ipos.zero_()
-    bc.res_body_iquat.zero_()
-    wp.launch(
-      adjoint_recompute._inertial_frames_recompute,
-      dim=(d.nworld, m.nbody),
-      inputs=[m.body_ipos, m.body_iquat, d.xpos, d.xquat],
-      outputs=[d.xipos, d.ximat],
-      adj_inputs=[bc.res_body_ipos, bc.res_body_iquat, None, None],
-      adj_outputs=[bc.adj_xipos, bc.adj_ximat],
-      adjoint=True,
-    )
+  pose_worlds = d.nworld if body_ipos_grad or body_iquat_grad else 0
   model_worlds = max(
     param.shape[0] for param in (m.body_mass, m.body_inertia, m.body_ipos, m.body_iquat) if param.requires_grad
   )
   wp.launch(
-    _accum_inertial_params(body_mass_grad, body_inertia_grad, body_ipos_grad, body_iquat_grad, scale),
-    dim=(model_worlds, m.nbody),
-    inputs=[bc.res_body_mass, bc.res_body_inertia, bc.res_body_ipos, bc.res_body_iquat],
+    _inertia_vjp(body_mass_grad, body_inertia_grad, body_ipos_grad, body_iquat_grad, scale),
+    dim=(max(model_worlds, pose_worlds), m.nbody),
+    inputs=[m.body_ipos, m.body_iquat, d.xquat, bc.adj_xipos, bc.adj_xiquat, bc.res_body_mass, bc.res_body_inertia],
     outputs=[m.body_mass.grad, m.body_inertia.grad, m.body_ipos.grad, m.body_iquat.grad],
   )

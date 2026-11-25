@@ -14,7 +14,7 @@
 # ==============================================================================
 """Analytic backward for step() via hybrid analytic differentiability.
 
-This modules uses implicit differentiation, auto-differentiation, and custom analytic
+This module uses implicit differentiation, auto-differentiation, and custom analytic
 derivatives to compute analytic gradients. For the stationarity residual r(qacc, theta) = 0,
 reverse mode solves H * lam = adj_qacc and accumulates adj_theta = -(dr/dtheta)^T * lam.
 """
@@ -32,6 +32,8 @@ from mujoco_warp._src import adjoint_util
 from mujoco_warp._src import collision_adjoint
 from mujoco_warp._src import collision_convex_adjoint
 from mujoco_warp._src import constraint_adjoint
+from mujoco_warp._src import derivative
+from mujoco_warp._src import diff
 from mujoco_warp._src import forward
 from mujoco_warp._src import forward_adjoint
 from mujoco_warp._src import io
@@ -40,6 +42,7 @@ from mujoco_warp._src import model_adjoint
 from mujoco_warp._src import smooth
 from mujoco_warp._src import smooth_kinematics_adjoint
 from mujoco_warp._src import solver
+from mujoco_warp._src.types import H_ONE_TILE_MAX
 from mujoco_warp._src.types import TILE_SIZE_JTDAJ_DENSE
 from mujoco_warp._src.types import BackwardContext
 from mujoco_warp._src.types import BiasType
@@ -77,12 +80,42 @@ def backward_context(bc: BackwardContext):
     _ACTIVE_BACKWARD_CONTEXT.reset(token)
 
 
+# BackwardContext scratch accumulators; helper-local buffers are initialized by their producers.
+_SCRATCH_FIELDS_TO_ZERO = (
+  # State and residual accumulators.
+  "adj_qpos",
+  "adj_qvel",
+  "adj_qacc",
+  "adj_mocap_pos",
+  "adj_mocap_quat",
+  "res_qpos",
+  "res_qvel",
+  "adj_dof",
+  "res_dof",
+  # Contact accumulators.
+  "adj_efc_pos",
+  "adj_contact_pos",
+  "adj_contact_frame",
+  "adj_subtree_com",
+  "adj_cdof",
+  # Constraint-parameter accumulators.
+  "res_dof_frictionloss",
+  "res_dof_solref",
+  "res_dof_solimp",
+  "res_eq_solref",
+  "res_eq_solimp",
+  "res_jnt_solref",
+  "res_jnt_solimp",
+)
+
+
 def _reset_backward_context(bc: BackwardContext):
-  """Zeros a backward context and its array gradients."""
+  """Resets accumulators, leaving producer-initialized scratch for its next use."""
   for field in dataclasses.fields(bc):
     value = getattr(bc, field.name)
     if isinstance(value, wp.array):
-      value.zero_()
+      if field.name in _SCRATCH_FIELDS_TO_ZERO:
+        value.zero_()
       if value.grad is not None:
         value.grad.zero_()
 
@@ -97,6 +130,8 @@ def _model_supported(m: Model) -> tuple[tuple[str, ...], frozenset[str]]:
   cached = _SUPPORTED_CACHE.get(key)
   if cached is not None and cached[0]() is m:
     return (), cached[1]
+  if wp.get_device().is_capturing:
+    raise NotImplementedError("call create_backward_context or record a supported step before CUDA graph capture")
 
   reasons = []
   unsupported_parameters = set()
@@ -160,17 +195,12 @@ def _assert_model_supported(m: Model):
   """Rejects unsupported model capabilities and requested parameter gradients."""
   reasons, limitations = _model_supported(m)
   if reasons:
-    raise NotImplementedError(
-      "smooth_adjoint analytic reverse does not support: "
-      + "; ".join(reasons)
-      + ". Implement the leaf/topology VJP (the FD oracle lives in adjoint_test_util). "
-      "There is no silent FD fallback."
-    )
+    raise NotImplementedError("adjoint.step_backward does not support: " + "; ".join(reasons))
   # Gradient requests can change; cached parameter-layout limitations do not.
   unsupported = sorted(name for name in limitations if getattr(m, name).requires_grad)
   if unsupported:
     raise NotImplementedError(
-      "smooth_adjoint analytic reverse does not support: "
+      "adjoint.step_backward does not support: "
       + "; ".join(f"{name} gradients with a compiled free-body mass layout missing couplings" for name in unsupported)
     )
 
@@ -192,27 +222,22 @@ def _create_backward_context(m: Model, d: Data) -> BackwardContext:
     if is_array_spec(field.type)
   }
   arrays.update(
-    res_dof_frictionloss=wp.zeros_like(m.dof_frictionloss),
-    res_dof_solref=wp.zeros_like(m.dof_solref),
-    res_dof_solimp=wp.zeros_like(m.dof_solimp),
-    res_eq_solref=wp.zeros_like(m.eq_solref),
-    res_eq_solimp=wp.zeros_like(m.eq_solimp),
-    res_jnt_solref=wp.zeros_like(m.jnt_solref),
-    res_jnt_solimp=wp.zeros_like(m.jnt_solimp),
-    res_body_mass=wp.zeros_like(m.body_mass),
-    res_body_inertia=wp.zeros_like(m.body_inertia),
-    res_body_ipos=wp.zeros_like(m.body_ipos),
-    res_body_iquat=wp.zeros_like(m.body_iquat),
+    res_dof_frictionloss=wp.zeros_like(m.dof_frictionloss, requires_grad=False),
+    res_dof_solref=wp.zeros_like(m.dof_solref, requires_grad=False),
+    res_dof_solimp=wp.zeros_like(m.dof_solimp, requires_grad=False),
+    res_eq_solref=wp.zeros_like(m.eq_solref, requires_grad=False),
+    res_eq_solimp=wp.zeros_like(m.eq_solimp, requires_grad=False),
+    res_jnt_solref=wp.zeros_like(m.jnt_solref, requires_grad=False),
+    res_jnt_solimp=wp.zeros_like(m.jnt_solimp, requires_grad=False),
+    res_body_mass=wp.zeros_like(m.body_mass, requires_grad=False),
+    res_body_inertia=wp.zeros_like(m.body_inertia, requires_grad=False),
   )
-  bc = BackwardContext(
+  return BackwardContext(
     solver_ctx=solver._create_solver_context(m, d),
     scratch=adjoint_util._clone_nograd(d),
     collision_convex_ctx=collision_convex_adjoint.create_collision_convex_backward_context(m, d),
     **arrays,
   )
-  for name in ("contact_V", "contact_A", "contact_Z", "contact_phi", "efc_Z", "efc_phi", "smooth_r"):
-    getattr(bc, name).requires_grad = True
-  return bc
 
 
 def _assert_step_supported(m: Model):
@@ -235,7 +260,7 @@ def _assert_step_supported(m: Model):
     raise NotImplementedError("adjoint.step_backward does not support surface velocity")
   if not m.opt.run_collision_detection:
     raise NotImplementedError("adjoint.step_backward does not support caller-supplied contacts (run_collision_detection=False)")
-  if m.opt.enableflags & EnableBit.SLEEP and not (m.opt.disableflags & DisableBit.ISLAND):
+  if (m.opt.enableflags & EnableBit.SLEEP) and not (m.opt.disableflags & DisableBit.ISLAND):
     raise NotImplementedError("adjoint.step_backward does not support sleep")
   if m.eq_connect_adr.size or m.eq_wld_adr.size or m.ntendon or m.nflex:
     raise NotImplementedError("adjoint.step_backward does not support connect/weld equality, tendon, or flex constraint rows")
@@ -264,7 +289,7 @@ def _solve_adjoint_cholesky(nv: int):
     w = wp.tid()
     h = wp.tile_load(h_in[w], shape=(nv, nv))
     wp.tile_cholesky_inplace(h, fill_mode="upper")
-    rhs = wp.tile_load(rhs_in[w], shape=nv)
+    rhs = wp.tile_load(rhs_in[w], shape=nv, bounds_check=True)
     solution = wp.tile_cholesky_solve(h, rhs, fill_mode="upper")
     wp.tile_store(solution_out[w], solution)
 
@@ -279,24 +304,22 @@ def solve_backward(m: Model, d_bwd: Data, adj_qacc: wp.array, bc: BackwardContex
     if m.nv:
       smooth.solve_m(m, d_bwd, solver_ctx.search, adj_qacc)
     return solver_ctx
-  solver.init_context(m, d_bwd, solver_ctx, grad=True)
-  # Only the Hessian is needed; replace the initializer's gradient with the adjoint RHS.
-  wp.launch(_load_rhs, dim=(d_bwd.nworld, m.nv_pad), inputs=[m.nv, adj_qacc], outputs=[solver_ctx.grad])
-  if m.nv <= solver._BLOCK_CHOLESKY_DIM:
+  # Reuse forward's constraint states and forces instead of recomputing them
+  # from J @ qacc via init_context(), which can change the active set at a boundary.
+  solver_ctx.done.zero_()
+  solver._init_jaref(m, d_bwd, solver_ctx)
+  solver._update_hessian(m, d_bwd, solver_ctx)
+  if m.nv <= H_ONE_TILE_MAX:
     wp.launch_tiled(
-      _solve_adjoint_cholesky(m.nv),
+      _solve_adjoint_cholesky(m.nv_pad),
       dim=d_bwd.nworld,
-      inputs=[solver_ctx.h, solver_ctx.grad],
+      inputs=[solver_ctx.h, adj_qacc],
       outputs=[solver_ctx.search],
       block_dim=m.block_dim.update_gradient_cholesky,
     )
   else:
-    wp.launch(
-      solver._padding_h,
-      dim=(d_bwd.nworld, m.nv_pad - m.nv),
-      inputs=[m.nv, solver_ctx.done],
-      outputs=[solver_ctx.h],
-    )
+    wp.launch(_load_rhs, dim=(d_bwd.nworld, m.nv_pad), inputs=[m.nv, adj_qacc], outputs=[solver_ctx.grad])
+    # _update_hessian initializes the padded block to the identity.
     rhs = solver_ctx.grad.reshape((d_bwd.nworld, m.nv_pad, 1))
     # This helper loads the entire RHS before storing its solution, so reuse the padded buffer.
     wp.launch_tiled(
@@ -311,7 +334,7 @@ def solve_backward(m: Model, d_bwd: Data, adj_qacc: wp.array, bc: BackwardContex
 
 
 @event_scope
-def _residual_constraint_sparse(
+def _residual_constraint(
   m: Model,
   d: Data,
   d_bwd: Data,
@@ -321,68 +344,29 @@ def _residual_constraint_sparse(
   res_dof: wp.array,
   bc: BackwardContext,
 ):
-  """Contracts all active non-contact rows and accumulates their residual VJP."""
-  nworld, nv = d_bwd.nworld, m.nv
-  njmax = d_bwd.efc.type.shape[1]
-  efc_Z, efc_invw = bc.efc_Z, bc.efc_invw
-  gather = constraint_adjoint._constraint_gather(m.is_sparse)
+  """Contracts active non-contact rows and scatters their state and parameter cotangents."""
+  params = model_adjoint._constraint_param_pairs(m, bc)
   wp.launch(
-    gather,
-    dim=(nworld, njmax),
+    constraint_adjoint._constraint_residual(m.is_sparse, any(param.requires_grad for param, _ in params)),
+    dim=(d_bwd.nworld, d_bwd.efc.type.shape[1]),
     inputs=[
-      nv,
-      m.jnt_dofadr,
-      m.dof_invweight0,
-      m.eq_obj1id,
-      m.eq_obj2id,
-      d_bwd.nefc,
-      d_bwd.efc.type,
-      d_bwd.efc.id,
-      d_bwd.efc.J_rownnz,
-      d_bwd.efc.J_rowadr,
-      d_bwd.efc.J_colind,
-      d_bwd.efc.J,
-      d_bwd.efc.state,
-      lam,
-    ],
-    outputs=[efc_Z, efc_invw],
-  )
-
-  efc_phi = bc.efc_phi
-  res_efc_pos, res_efc_vel = bc.adj_efc_pos, bc.adj_efc_vel
-  constraint_params = model_adjoint._constraint_param_pairs(m, bc)
-  pairs = [
-    (m.opt.timestep, None),
-    (m.opt.disableflags, None),
-    *((param, residual if param.requires_grad else None) for param, residual in constraint_params),
-    (d_bwd.nefc, None),
-    (d_bwd.efc.type, None),
-    (d_bwd.efc.id, None),
-    (d_bwd.efc.pos, res_efc_pos),
-    (d_bwd.efc.margin, None),
-    (d_bwd.efc.D, None),
-    (d_bwd.efc.vel, res_efc_vel),
-    (d_bwd.efc.aref, None),
-    (d_bwd.efc.force, None),
-    (d_bwd.efc.state, None),
-    (efc_Z, efc_Z.grad),
-    (efc_invw, None),
-    (ctx_Jaref, None),
-  ]
-  efc_phi.grad.fill_(1.0)
-  adjoint_util._launch_vjp(constraint_adjoint._constraint_row_phi, (nworld, njmax), pairs, [efc_phi], [efc_phi.grad])
-
-  scatter = constraint_adjoint._constraint_scatter(m.is_sparse)
-  wp.launch(
-    scatter,
-    dim=(nworld, njmax),
-    inputs=[
-      nv,
+      m.nv,
+      m.opt.timestep,
+      m.opt.disableflags,
       m.qpos0,
       m.jnt_type,
       m.jnt_qposadr,
       m.jnt_dofadr,
+      m.jnt_solref,
+      m.jnt_solimp,
+      m.dof_solref,
+      m.dof_solimp,
+      m.dof_frictionloss,
+      m.dof_invweight0,
+      m.eq_obj1id,
       m.eq_obj2id,
+      m.eq_solref,
+      m.eq_solimp,
       m.eq_data,
       d_bwd.nefc,
       d.qpos,
@@ -394,17 +378,18 @@ def _residual_constraint_sparse(
       d_bwd.efc.J_rowadr,
       d_bwd.efc.J_colind,
       d_bwd.efc.J,
+      d_bwd.efc.pos,
+      d_bwd.efc.margin,
       d_bwd.efc.D,
+      d_bwd.efc.vel,
+      d_bwd.efc.aref,
+      d_bwd.efc.force,
       d_bwd.efc.state,
-      res_efc_pos,
-      res_efc_vel,
       lam,
-      efc_Z,
-      efc_Z.grad,
+      ctx_Jaref,
     ],
-    outputs=[res_qvel, res_dof],
+    outputs=[res_qvel, res_dof, *(residual if param.requires_grad else None for param, residual in params)],
   )
-
   model_adjoint.constraint_params_backward(m, bc)
 
 
@@ -420,7 +405,7 @@ def noncontact_constraint_backward(
   bc: BackwardContext,
 ):
   """Accumulates non-contact residuals in input position and velocity space."""
-  _residual_constraint_sparse(m, d, d_bwd, ctx_Jaref, lam, res_qvel, bc.res_dof, bc)
+  _residual_constraint(m, d, d_bwd, ctx_Jaref, lam, res_qvel, bc.res_dof, bc)
   wp.launch(
     smooth_kinematics_adjoint._dof_to_qpos,
     dim=(d.nworld, m.njnt),
@@ -437,80 +422,59 @@ def _residual_contact(
   res_qvel: wp.array,
   bc: BackwardContext,
 ):
-  """Contracts contact rows before differentiating the loop-free cone leaf."""
-  nconmax = d_bwd.contact.pos.shape[0]
-  contact_V, contact_A, contact_Z = bc.contact_V, bc.contact_A, bc.contact_Z
-  contact_phi = bc.contact_phi
-  res_cdof, res_subtree_com = bc.adj_cdof, bc.adj_subtree_com
-  res_efc_pos = bc.adj_efc_pos
-  res_contact_pos, res_contact_frame = bc.adj_contact_pos, bc.adj_contact_frame
-  walk = [m.body_rootid, m.body_weldid, m.body_dofnum, m.body_dofadr, m.dof_parentid, m.geom_bodyid]
-  state = [
-    d.qvel,
-    d_bwd.qacc,
-    d_bwd.subtree_com,
-    d_bwd.cdof,
-    d_bwd.contact.pos,
-    d_bwd.contact.geom,
-    d_bwd.contact.efc_address,
-    d_bwd.contact.worldid,
-    d_bwd.nacon,
-  ]
+  """Accumulates contact residual VJPs without staging per-contact spatial adjoints."""
   wp.launch(
-    constraint_adjoint._contact_gather,
-    dim=nconmax,
-    inputs=walk + state + [lam],
-    outputs=[contact_V, contact_A, contact_Z],
-  )
-
-  geom_friction_grad = m.geom_friction.requires_grad
-  pair_friction_grad = m.pair_friction.requires_grad
-  res_contact_friction = bc.adj_contact_friction
-
-  pairs = [
-    (m.opt.timestep, None),
-    (m.opt.disableflags, None),
-    (m.opt.impratio_invsqrt, None),
-    (m.body_invweight0, None),
-    (m.geom_bodyid, None),
-    (d_bwd.contact.frame, res_contact_frame),
-    (d_bwd.contact.friction, res_contact_friction),
-    (d_bwd.contact.solref, None),
-    (d_bwd.contact.solreffriction, None),
-    (d_bwd.contact.solimp, None),
-    (d_bwd.contact.dim, None),
-    (d_bwd.contact.geom, None),
-    (d_bwd.contact.efc_address, None),
-    (d_bwd.contact.worldid, None),
-    (d_bwd.efc.pos, res_efc_pos),
-    (d_bwd.efc.margin, None),
-    (d_bwd.efc.state, None),
-    (d_bwd.nacon, None),
-    (contact_V, contact_V.grad),
-    (contact_A, contact_A.grad),
-    (contact_Z, contact_Z.grad),
-  ]
-  contact_phi.grad.fill_(1.0)
-  kernel = constraint_adjoint._contact_phi(int(m.opt.cone))
-  adjoint_util._launch_vjp(kernel, nconmax, pairs, [contact_phi], [contact_phi.grad])
-  wp.launch(
-    constraint_adjoint._contact_scatter(geom_friction_grad, pair_friction_grad),
-    dim=nconmax,
+    constraint_adjoint._contact_residual(int(m.opt.cone), m.geom_friction.requires_grad, m.pair_friction.requires_grad),
+    dim=d_bwd.naconmax,
+    # A warp per block spreads sparse contact batches across more SMs.
+    block_dim=32,
     inputs=[
       m.ngeom,
-      *walk,
+      m.opt.timestep,
+      m.opt.disableflags,
+      m.opt.impratio_invsqrt,
+      m.body_rootid,
+      m.body_weldid,
+      m.body_dofnum,
+      m.body_dofadr,
+      m.body_invweight0,
+      m.dof_parentid,
+      m.geom_bodyid,
       m.geom_priority,
       m.geom_friction,
       m.pair_friction,
       m.nxn_pairid,
-      *state,
+      d.qvel,
+      d_bwd.qacc,
+      d_bwd.subtree_com,
+      d_bwd.cdof,
+      d_bwd.contact.pos,
+      d_bwd.contact.frame,
+      d_bwd.contact.friction,
+      d_bwd.contact.solref,
+      d_bwd.contact.solreffriction,
+      d_bwd.contact.solimp,
+      d_bwd.contact.dim,
+      d_bwd.contact.geom,
+      d_bwd.contact.efc_address,
+      d_bwd.contact.worldid,
+      d_bwd.efc.pos,
+      d_bwd.efc.margin,
+      d_bwd.efc.force,
+      d_bwd.efc.state,
+      d_bwd.nacon,
       lam,
-      contact_V.grad,
-      contact_A.grad,
-      contact_Z.grad,
-      res_contact_friction,
     ],
-    outputs=[res_qvel, res_cdof, res_subtree_com, res_contact_pos, m.geom_friction.grad, m.pair_friction.grad],
+    outputs=[
+      res_qvel,
+      bc.adj_cdof,
+      bc.adj_subtree_com,
+      bc.adj_contact_pos,
+      bc.adj_contact_frame,
+      bc.adj_efc_pos,
+      m.geom_friction.grad,
+      m.pair_friction.grad,
+    ],
   )
 
 
@@ -546,24 +510,14 @@ def contact_constraint_backward(
 def smooth_params_backward(m: Model, d: Data, d_bwd: Data, lam: wp.array, bc: BackwardContext):
   """Accumulates smooth Model parameter gradients."""
   if m.dof_armature.requires_grad or m.dof_damping.requires_grad:
-    pairs = [
-      (m.opt.disableflags, None),
-      (m.dof_armature, m.dof_armature.grad if m.dof_armature.requires_grad else None),
-      (m.dof_damping, m.dof_damping.grad if m.dof_damping.requires_grad else None),
-      # State VJPs were already consumed; explicit sinks avoid Warp's .grad fallback.
-      (d.qvel, bc.smooth_adj_qvel),
-      (d_bwd.qacc, bc.smooth_adj_qacc),
-      (lam, None),
-      (bc.y_remap, None),
-      (bc.w_dir, None),
-    ]
-    bc.smooth_r.grad.fill_(-1.0)
-    adjoint_util._launch_vjp(
-      model_adjoint._smooth_param_contraction,
-      (d.nworld, m.nv),
-      pairs,
-      [bc.smooth_r],
-      [bc.smooth_r.grad],
+    wp.launch(
+      model_adjoint._smooth_param_vjp,
+      dim=(d.nworld, m.nv),
+      inputs=[m.opt.disableflags, m.dof_armature, m.dof_damping, d.qvel, d_bwd.qacc, lam, bc.y_remap, bc.w_dir],
+      outputs=[
+        m.dof_armature.grad if m.dof_armature.requires_grad else None,
+        m.dof_damping.grad if m.dof_damping.requires_grad else None,
+      ],
     )
 
 
@@ -575,8 +529,10 @@ def _accum_input_adjoint(direct: wp.array2d[float], residual: wp.array2d[float],
 
 def _write_input_adjoints(d: Data, bc: BackwardContext):
   """Combines direct state adjoints with implicit residual VJPs."""
-  wp.launch(_accum_input_adjoint, dim=d.qpos.shape, inputs=[bc.adj_qpos, bc.res_qpos], outputs=[d.qpos.grad])
-  wp.launch(_accum_input_adjoint, dim=d.qvel.shape, inputs=[bc.adj_qvel, bc.res_qvel], outputs=[d.qvel.grad])
+  if d.qpos.grad is not None:
+    wp.launch(_accum_input_adjoint, dim=d.qpos.shape, inputs=[bc.adj_qpos, bc.res_qpos], outputs=[d.qpos.grad])
+  if d.qvel.grad is not None:
+    wp.launch(_accum_input_adjoint, dim=d.qvel.shape, inputs=[bc.adj_qvel, bc.res_qvel], outputs=[d.qvel.grad])
 
 
 @event_scope
@@ -588,11 +544,7 @@ def forward_backward_ift(m: Model, d: Data, d_bwd: Data, adj_qacc: wp.array, bc:
     contact_constraint_backward(m, d, d_bwd, lam, bc.res_qpos, bc.res_qvel, bc)
     noncontact_constraint_backward(m, d, d_bwd, lam, bc.res_qpos, bc.res_qvel, solver_ctx.Jaref, bc)
   forward_adjoint.smooth_qvel_backward(m, d, d_bwd, lam, bc.adj_qvel, bc)
-  forward_adjoint.smooth_qpos_backward(m, d, d_bwd, lam, bc.res_qpos, bc)
-  # The position reverse also computes the RNE velocity cotangents. Consume them
-  # with the residual sign before parameter VJPs reuse the workspace.
-  for cotangent in (bc.smooth_adj_qvel, bc.smooth_cv_adj_qvel):
-    wp.launch(adjoint_util._accum_cols, dim=(d.nworld, m.nv), inputs=[cotangent], outputs=[bc.res_qvel])
+  forward_adjoint.smooth_qpos_backward(m, d, d_bwd, lam, bc.res_qpos, bc.res_qvel, bc)
   smooth_params_backward(m, d, d_bwd, lam, bc)
 
 
@@ -608,7 +560,7 @@ _STEP_OUT_FIELDS = (
   "act",
   "act_dot",
 )
-# Supported differentiable mjSTATE_USER inputs, selected separately from state gradients.
+# Supported differentiable mjSTATE_USER inputs, including copies to the output Data.
 _STEP_USER_FIELDS = (
   "ctrl",
   "qfrc_applied",
@@ -640,31 +592,27 @@ _KINEMATICS_IN_FIELDS = ("qpos", "mocap_pos", "mocap_quat")
 _KINEMATICS_OUT_FIELDS = ("site_xpos", "xpos", "xquat")
 
 
-def _data_arrays(d: Data, fields: tuple[str, ...], *, force_grad: bool = True) -> list[wp.array]:
-  """Returns nonempty Data arrays that require gradients, optionally enabling them first."""
-  arrays = [getattr(d, name) for name in fields if getattr(d, name).size]
-  if force_grad:
-    for array in arrays:
-      array.requires_grad = True
-  return [array for array in arrays if array.requires_grad]
+def _has_kinematics_grad(d: Data) -> bool:
+  """Returns whether a nonempty kinematic output has a gradient buffer."""
+  return any(getattr(d, name).size and getattr(d, name).requires_grad for name in _KINEMATICS_OUT_FIELDS)
 
 
-def _model_arrays(m: Model) -> list[wp.array]:
-  """Returns opted-in model parameters, rejecting incomplete step derivatives."""
-  parameters = {
-    prefix + name: value
-    for prefix, obj in (("", m), ("opt.", m.opt))
-    for name, value in vars(obj).items()
-    if isinstance(value, wp.array) and value.size and value.requires_grad
-  }
-  unsupported = parameters.keys() - set(_STEP_MODEL_FIELDS)
-  if unsupported:
-    raise NotImplementedError("native step parameter gradients are not implemented for: " + ", ".join(sorted(unsupported)))
-  return list(parameters.values())
+def _shares_memory(a: wp.array, b: wp.array) -> bool:
+  """Returns whether two nonempty arrays share any memory."""
+  return bool(a.size and b.size) and a.ptr < b.ptr + b.capacity and b.ptr < a.ptr + a.capacity
 
 
 def step_supported(m: Model, d: Data, d_out: Data | None = None) -> tuple[str, ...]:
   """Returns unsupported-step reasons using the diff API's callback signature."""
+  if d_out is None or d_out is d:
+    return ("step() differentiation requires distinct input and output Data; in-place is unsupported",)
+  for name in ("nworld", "naconmax", "njmax"):
+    if getattr(d, name) != getattr(d_out, name):
+      return (f"step() differentiation expected matching {name}",)
+  # The backward linearizes at the input state, so the step must not overwrite it.
+  for name in _STEP_IN_FIELDS:
+    if any(_shares_memory(getattr(d, name), getattr(d_out, out)) for out in _STEP_OUT_FIELDS):
+      return (f"step() differentiation requires distinct state buffers; input {name} aliases output state",)
   try:
     _assert_step_supported(m)
     _assert_model_supported(m)
@@ -673,31 +621,6 @@ def step_supported(m: Model, d: Data, d_out: Data | None = None) -> tuple[str, .
   except NotImplementedError as error:
     return (str(error),)
   return ()
-
-
-def step_backward_arrays(d: Data, d_out: Data, m: Model | None = None, *, user_fields: tuple[str, ...] = ("ctrl",)):
-  """Prepares state gradients and selected user-input gradients for the legacy tape adapter.
-
-  Explicitly enabled user-input gradients are also tracked. The diff API will own this selection.
-  """
-  for name in ("nworld", "naconmax", "njmax"):
-    assert getattr(d, name) == getattr(d_out, name), f"step() differentiation expected matching {name}"
-  requested = set(user_fields)
-  unsupported = requested - set(_STEP_USER_FIELDS)
-  if unsupported:
-    raise NotImplementedError("native step user-input gradients are not implemented for: " + ", ".join(sorted(unsupported)))
-  parameters = _model_arrays(m) if m is not None else []
-  arrays = [
-    *_data_arrays(d, _STEP_IN_FIELDS),
-    *_data_arrays(d_out, _STEP_OUT_FIELDS),
-    *_data_arrays(d_out, _KINEMATICS_OUT_FIELDS, force_grad=False),
-  ]
-  for name in _STEP_USER_FIELDS:
-    if name in requested or getattr(d, name).requires_grad or getattr(d_out, name).requires_grad:
-      arrays.extend(_data_arrays(d, (name,)))
-      arrays.extend(_data_arrays(d_out, (name,)))
-  arrays.extend(parameters)
-  return list(dict.fromkeys(array for array in arrays if array.size))
 
 
 @wp.kernel(enable_backward=False)
@@ -750,7 +673,7 @@ def _accum_kinematics_adjoints(
 
 
 def _write_kinematics_adjoints(d: Data, bc: BackwardContext):
-  """Accumulates FK input gradients and consumes its overwritten output seeds."""
+  """Accumulates FK input gradients and consumes its overwritten output cotangents."""
   grads = [
     d.qpos.grad,
     d.mocap_pos.grad,
@@ -779,8 +702,8 @@ def _clear_kinematics_adjoints(d: Data):
 
 
 def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -> Data:
-  """Prepares backward scratch from forward inputs and retained intermediates."""
-  kinematics_grad = bool(_data_arrays(d_out, _KINEMATICS_OUT_FIELDS, force_grad=False))
+  """Prepares backward inputs, replayed kinematics and velocity matrices."""
+  kinematics_grad = _has_kinematics_grad(d_out)
   d_kin = bc.scratch if kinematics_grad else d_out
   # Borrow only read-only state and forward caches; all other fields remain backward scratch.
   d_bwd = dataclasses.replace(
@@ -802,11 +725,11 @@ def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -
     qacc=d_out.qacc,
     xpos=d_kin.xpos,
     xquat=d_kin.xquat,
-    xmat=d_kin.xmat,
     xipos=d_kin.xipos,
-    ximat=d_kin.ximat,
+    xiquat=d_kin.xiquat,
+    xanchor=d_kin.xanchor,
     geom_xpos=d_kin.geom_xpos,
-    geom_xmat=d_kin.geom_xmat,
+    geom_xquat=d_kin.geom_xquat,
     subtree_com=d_kin.subtree_com,
     cdof=d_kin.cdof,
     cinert=d_kin.cinert,
@@ -860,6 +783,8 @@ def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -
       vel=d_out.efc.vel,
       aref=d_out.efc.aref,
       frictionloss=d_out.efc.frictionloss,
+      force=d_out.efc.force,
+      state=d_out.efc.state,
       jtdaj_adr=d_out.efc.jtdaj_adr,
       jtdaj_nrow=d_out.efc.jtdaj_nrow,
       jtdaj_nblock=d_out.efc.jtdaj_nblock,
@@ -870,6 +795,9 @@ def step_backward_scratch(m: Model, d: Data, d_out: Data, bc: BackwardContext) -
     # Step backward needs kinematics and COM values computed from d.qpos.
     smooth.kinematics(m, d_bwd)
     smooth.com_pos(m, d_bwd)
+  # Keep the force layout before integration modifies qDeriv's free-body blocks.
+  derivative.deriv_smooth_vel(m, d_bwd, bc.qDeriv)
+  wp.launch(forward._map_m2d, dim=(d_bwd.nworld, m.nD), inputs=[m.mapM2D, bc.qDeriv], outputs=[bc.qLU])
   return d_bwd
 
 
@@ -885,12 +813,10 @@ def step_backward(m: Model, d: Data, d_out: Data, bc: BackwardContext | None = N
 @event_scope
 def _step_backward(m: Model, d: Data, d_out: Data, bc: BackwardContext | None = None):
   """Computes the step adjoint after support validation."""
-  # TODO: Remove this compatibility preparation when the diff API registers the rule (#1727).
-  step_backward_arrays(d, d_out, m, user_fields=())
   bc = bc or _ACTIVE_BACKWARD_CONTEXT.get() or _create_backward_context(m, d)
   _reset_backward_context(bc)
   d_bwd = step_backward_scratch(m, d, d_out, bc)
-  kinematics_grad = bool(_data_arrays(d_out, _KINEMATICS_OUT_FIELDS, force_grad=False))
+  kinematics_grad = _has_kinematics_grad(d_out)
   if kinematics_grad:
     forward_adjoint.kinematics_backward(m, d_out, d_bwd, bc)
   _, _, adj_qacc = forward_adjoint.advance_backward(m, d_out, d_bwd, bc)
@@ -899,12 +825,13 @@ def _step_backward(m: Model, d: Data, d_out: Data, bc: BackwardContext | None = 
   _write_user_adjoints(d, d_out, bc)
   if kinematics_grad:
     _clear_kinematics_adjoints(d_out)
-
-
-def fwd_kinematics_arrays(d: Data):
-  """Returns kinematic gradient arrays, keeping fixed mocap inputs opt-in."""
-  inputs = tuple(name for name in _KINEMATICS_IN_FIELDS if name == "qpos" or getattr(d, name).requires_grad)
-  return _data_arrays(d, inputs + _KINEMATICS_OUT_FIELDS)
+  # These values overwrite their output buffers. Shared user inputs keep their accumulated
+  # cotangents; distinct copies must be consumed before an earlier call receives them.
+  for name in _STEP_OUT_FIELDS + _STEP_USER_FIELDS:
+    output = getattr(d_out, name)
+    source = getattr(d, name)
+    if output.grad is not None and (source.grad is None or output.grad.ptr != source.grad.ptr):
+      output.grad.zero_()
 
 
 def fwd_kinematics_backward_scratch(d: Data, bc: BackwardContext) -> Data:
@@ -915,7 +842,7 @@ def fwd_kinematics_backward_scratch(d: Data, bc: BackwardContext) -> Data:
 @event_scope
 def fwd_kinematics_backward(m: Model, d: Data, bc: BackwardContext | None = None):
   """Maps Cartesian body/site cotangents to qpos and mocap inputs."""
-  kinematics_grad = bool(_data_arrays(d, _KINEMATICS_OUT_FIELDS, force_grad=False))
+  kinematics_grad = _has_kinematics_grad(d)
   if not kinematics_grad:
     return
   bc = bc or _ACTIVE_BACKWARD_CONTEXT.get() or _create_backward_context(m, d)
@@ -925,25 +852,40 @@ def fwd_kinematics_backward(m: Model, d: Data, bc: BackwardContext | None = None
   _write_kinematics_adjoints(d, bc)
 
 
+# TODO(etaoxing): Deprecate enable_grad() once the upstream Warp gradient fixes and tape APIs land.
 def enable_grad() -> None:
-  """Installs numerical derivative rules and analytic backward hooks.
+  """Installs numerical derivatives and registers analytic rules with the diff API.
 
   Replaces ``wp.sqrt`` with ``adjoint_util.safe_sqrt``, whose float32 and float64 adjoints
-  contribute zero at zero, and registers custom quaternion gradients. Also enables forward
-  recording and the step and forward-kinematics backward hooks.
+  contribute zero at zero, and registers custom quaternion gradients. Step and forward
+  kinematics use the diff API for validation, gradient allocation, and tape recording.
 
   Call before building kernels that need these rules. The numerical rules apply process-wide,
-  independently of tapes and backward-hook registration.
+  independently of tapes and adjoint-rule registration.
 
-  Mocap input gradients are opt-in via requires_grad.
+  Declared Data inputs and outputs receive gradient buffers automatically; Model parameters
+  remain opt-in via requires_grad.
   Kinematic output gradients support site_xpos, xpos, and xquat. Step computes these
   before integration; call fwd_kinematics on the output to refresh them using the updated qpos.
 
   Backward reductions are nondeterministic, regardless of forward determinism options.
   """
-  forward.ENABLE_GRAD = True
   wp.sqrt = adjoint_util.safe_sqrt
   wp.func_grad(math.quat_integrate)(adjoint_util._adj_quat_integrate)
   wp.func_grad(math.quat_to_vel)(adjoint_util._adj_quat_to_vel)
-  forward.register_step_backward(_step_backward, step_backward_arrays, step_supported)
-  forward.register_fwd_kinematics_backward(fwd_kinematics_backward, fwd_kinematics_arrays)
+  diff.register_adjoint(
+    "step",
+    _step_backward,
+    in_fields=_STEP_IN_FIELDS + _STEP_USER_FIELDS,
+    out_fields=_STEP_OUT_FIELDS + _STEP_USER_FIELDS + _KINEMATICS_OUT_FIELDS,
+    model_fields=_STEP_MODEL_FIELDS,
+    supported=step_supported,
+  )
+  diff.register_adjoint(
+    "fwd_kinematics",
+    fwd_kinematics_backward,
+    in_fields=_KINEMATICS_IN_FIELDS,
+    out_fields=_KINEMATICS_OUT_FIELDS,
+    # These fields affect inertial caches, but not the differentiated body and site poses.
+    model_fields=("body_mass", "body_inertia", "body_ipos", "body_iquat"),
+  )
